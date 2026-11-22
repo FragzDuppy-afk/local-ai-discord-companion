@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import psutil
 import pynvml
+import telemetry_db
 
 load_dotenv()
 
@@ -102,14 +103,6 @@ SYSTEM_PROMPT = (
 )
 
 
-HEAVY_GAMES = {
-    "cod.exe",          # Call of Duty
-    "destiny2.exe",     # Destiny 2
-    "helldivers2.exe",  # Helldivers 2
-    "aces.exe",         # War Thunder
-    "grounded2.exe",    # Grounded 2
-    "javaw.exe",        # Modded Minecraft
-}
 
 WEATHER_KEYWORDS = {"weather", "temp", "temperature", "forecast", "outside"}
 SEARCH_KEYWORDS = {
@@ -163,6 +156,49 @@ def get_gaming_offload_notice() -> str | None:
 
     return None
 
+
+# >>> PASTE THIS HELPER RIGHT HERE <<<
+def check_session_milestone() -> str | None:
+  """Reads offloader_state.json for single-fire 2h/4h gaming session milestones."""
+  global last_handled_milestone
+  if not SESSION_ALERTS_ENABLED or not os.path.exists(OFFLOADER_STATE_FILE):
+    return None
+
+  try:
+    with open(OFFLOADER_STATE_FILE, "r", encoding="utf-8") as f:
+      data = json.load(f)
+
+    if not data.get("vram_offloaded", False):
+      last_handled_milestone = ""
+      return None
+
+    milestone = str(data.get("session_milestone", ""))
+    session_mins = int(data.get("session_minutes", 0))
+    reason = str(data.get("reason", "Active session")).replace(
+        "Unloaded for ", ""
+    )
+
+    if milestone and milestone != last_handled_milestone:
+      last_handled_milestone = milestone
+      hours = round(session_mins / 60, 1)
+      if milestone == "4h":
+        return (
+            f"⏳ **Extended Session Check-In ({hours}h), {USER_TITLE}:** "
+            f"Active workload detected ({reason}). Consider stepping away for water, "
+            f"stretching, and resting your eyes before continuing."
+        )
+      if milestone == "2h":
+        return (
+            f"🕒 **Session Milestone ({hours}h), {USER_TITLE}:** "
+            f"You've been running continuously ({reason}). Good checkpoint to grab water or stretch."
+        )
+  except (OSError, json.JSONDecodeError, ValueError):
+    pass
+
+  return None
+# >>> END OF HELPER <<<
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -174,27 +210,17 @@ game_paused = False
 relaxed_mode = False
 startup_sent = False
 
+# >>> PASTE STEP A RIGHT HERE <<<
+SESSION_ALERTS_ENABLED = (
+    os.getenv("SESSION_ALERTS_ENABLED", "true").strip().lower() == "true"
+)
+last_handled_milestone = ""
+# >>> END OF STEP A <<<
+
 
 # ==============================================================================
 # HARDWARE TELEMETRY & DYNAMIC VRAM HELPERS
 # ==============================================================================
-def get_running_heavy_game():
-  """Checks Windows tasklist for known heavy games."""
-  try:
-    output = (
-        subprocess.check_output(
-            ["tasklist", "/FO", "CSV", "/NH"],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        .decode("utf-8", errors="ignore")
-        .lower()
-    )
-    for game in HEAVY_GAMES:
-      if f'"{game}"' in output:
-        return game
-  except Exception:
-    pass
-  return None
 
 
 def get_gpu_vram_stats() -> dict:
@@ -235,30 +261,40 @@ def get_system_status():
   ram = psutil.virtual_memory()
   disk = psutil.disk_usage("C:\\")
   vram = get_gpu_vram_stats()
+  baseline = telemetry_db.get_rolling_baseline(24.0)
 
   ram_used_gb = round(ram.used / (1024**3), 1)
   ram_total_gb = round(ram.total / (1024**3), 1)
   disk_free_gb = round(disk.free / (1024**3), 1)
+
+  has_baseline = baseline["samples"] > 0
+  ram_avg_str = f" (24h Avg: {baseline['avg_ram']}%)" if has_baseline else ""
+  vram_avg_str = f" (24h Avg: {baseline['avg_vram']}%)" if has_baseline else ""
 
   # Dynamic status remarks
   cpu_remark = (
       "NOMINAL" if cpu < 75 else "ELEVATED — Check background processes"
   )
   ram_remark = (
-      "NOMINAL"
+      f"NOMINAL{ram_avg_str}"
       if ram.percent < 80
-      else "HIGH LOAD — Close unused browser tabs/apps"
+      else f"HIGH LOAD{ram_avg_str} — Close unused apps"
   )
 
   if vram["percent"] >= PAUSE_VRAM_PERCENT:
-    vram_remark = "CRITICAL (>=90%) — Model unloaded"
+    vram_remark = f"CRITICAL (>=90%){vram_avg_str} — Model unloaded"
   elif vram["percent"] >= RELAXED_VRAM_PERCENT:
-    vram_remark = "RELAXED MODE (>=80%) — Context window trimmed"
+    vram_remark = f"RELAXED MODE (>=80%){vram_avg_str} — Context trimmed"
   else:
-    vram_remark = "NOMINAL (Full Context Headroom)"
+    vram_remark = f"NOMINAL{vram_avg_str}"
 
   disk_remark = (
       "NOMINAL" if disk_free_gb > 50 else "LOW SPACE — Archive old logs/builds"
+  )
+  baseline_line = (
+      f"{baseline['samples']:,} Samples Logged | SQLite WAL Active"
+      if has_baseline
+      else "Calibrating (Waiting for Overseer samples)"
   )
 
   if game_paused:
@@ -275,6 +311,7 @@ def get_system_status():
       f"SYSTEM RAM   : {ram_used_gb}/{ram_total_gb} GB ({ram.percent}%) | {ram_remark}\n"
       f"GPU VRAM     : {vram['used_gb']}/{vram['total_gb']} GB ({vram['percent']}%) | {vram_remark}\n"
       f"PRIMARY SSD  : {disk_free_gb:>5} GB Free | {disk_remark}\n"
+      f"24H BASELINE : {baseline_line}\n"
       f"AI BACKEND   : {LLM_MODEL} (Port {LM_STUDIO_PORT}/v1) | {ai_state}\n"
       "============================================\n"
       "```"
@@ -429,20 +466,27 @@ async def system_monitor():
   now = datetime.now()
   channel = client.get_channel(CHANNEL_ID)
 
-  active_game = await asyncio.to_thread(get_running_heavy_game)
+  offload_notice = get_gaming_offload_notice()
+  milestone_msg = check_session_milestone()
+  if milestone_msg and channel:
+    await channel.send(milestone_msg)
+
   vram = await asyncio.to_thread(get_gpu_vram_stats)
   vram_pct = vram["percent"]
 
   # Update relaxed mode flag dynamically every 20 seconds
   relaxed_mode = RELAXED_VRAM_PERCENT <= vram_pct < PAUSE_VRAM_PERCENT
 
-  # Hysteresis pause check: pause at >= 90% VRAM (or heavy game), resume below 70%
-  should_pause = bool(active_game) or bool(get_gaming_offload_notice()) or (vram_pct >= PAUSE_VRAM_PERCENT and not game_paused) or (vram_pct > RESUME_VRAM_PERCENT and game_paused)
-
+  # Hysteresis pause check: pause when offloader is active or VRAM >= 90%, resume below 70%
+  should_pause = (
+      bool(offload_notice)
+      or (vram_pct >= PAUSE_VRAM_PERCENT and not game_paused)
+      or (vram_pct > RESUME_VRAM_PERCENT and game_paused)
+  )
 
   if should_pause and not game_paused:
     game_paused = True
-    reason = active_game if active_game else f"{vram_pct}% GPU VRAM"
+    reason = "Offloader Active" if offload_notice else f"{vram_pct}% GPU VRAM"
     print(
         f"High GPU demand detected ({reason}) — unloading VRAM and pausing"
         " AI Bot."
@@ -481,17 +525,32 @@ async def on_ready():
     startup_sent = True
     await asyncio.sleep(3)
     channel = client.get_channel(CHANNEL_ID)
-    if channel and not get_running_heavy_game():
+
+    # Skip LLM greeting if the offloader already claimed the GPU
+    if channel and not get_gaming_offload_notice():
       weather_info = await asyncio.to_thread(fetch_exact_weather)
       current_time_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
       prompt = (
-          f"[SYSTEM: Cycle Start triggered (NOT Cycle End — do NOT include wind-down advice or trivia). "
+          "[SYSTEM: Cycle Start triggered (NOT Cycle End — do NOT include"
+          " wind-down advice or trivia). "
           f"Current local time: {current_time_str}. Live weather data for"
           f" {DEFAULT_LOCATION}: {weather_info}\n"
-          "Greet me warmly for this exact time of day (morning/afternoon/evening) and state the current temperature and weather conditions.]"
+          "Greet me warmly for this exact time of day (morning/afternoon/evening)"
+          " and state the current temperature and weather conditions.]"
       )
-      reply = await asyncio.to_thread(ask_static, prompt)
-      await channel.send(reply[:1950])
+      try:
+        # Attempt full AI-generated greeting via LM Studio
+        reply = await asyncio.to_thread(ask_static, prompt)
+        await channel.send(reply[:1950])
+      except Exception as e:
+        # Cold-boot fallback: send direct telemetry + weather if weights are still loading
+        print(f"[COLD-START FALLBACK] LM Studio still warming up ({e}) — sending direct greeting.")
+        fallback_msg = (
+            f"⚡ **Systems Online, {USER_TITLE}.** Neural core is warming up in the background.\n"
+            f"🕒 **Local Time:** {current_time_str}\n"
+            f"🌤️ **Weather ({DEFAULT_LOCATION}):** {weather_info}"
+        )
+        await channel.send(fallback_msg[:1950])
 
 
 

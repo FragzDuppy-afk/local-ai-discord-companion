@@ -69,17 +69,41 @@ RELOAD_CMD = ["lms", "load", LLM_MODEL, "--gpu", "max"]
 
 POLL_INTERVAL_SEC = float(os.getenv("OFFLOADER_POLL_INTERVAL", "1.0"))
 RELOAD_COOLDOWN_SEC = float(os.getenv("OFFLOADER_RELOAD_COOLDOWN", "20.0"))
+# Optional NVIDIA GPU thermal check before reloading LLM weights
+try:
+  import pynvml
+
+  NVML_AVAILABLE = True
+except ImportError:
+  NVML_AVAILABLE = False
+
+RELOAD_MAX_GPU_TEMP_C = int(os.getenv("RELOAD_MAX_GPU_TEMP_C", "60"))
+
+# Gaming session milestone settings
+SESSION_REMINDER_ENABLED = (
+    os.getenv("SESSION_REMINDER_ENABLED", "true").strip().lower() == "true"
+)
+SESSION_REMARK_MINS = int(os.getenv("SESSION_REMARK_MINS", "120"))
+SESSION_ESCALATE_MINS = int(os.getenv("SESSION_ESCALATE_MINS", "240"))
+SESSION_GRACE_SEC = int(os.getenv("SESSION_GRACE_MINS", "5")) * 60
 
 
 # ==============================================================================
 # 2. ATOMIC STATE & HELPER FUNCTIONS
 # ==============================================================================
-def set_offload_state(offloaded: bool, reason: str = "") -> None:
-  """Atomically writes offload status so ai_bot.py & overseer.py never read a partial file."""
+def set_offload_state(
+    offloaded: bool,
+    reason: str = "",
+    session_minutes: int = 0,
+    session_milestone: str = "",
+) -> None:
+  """Atomically writes offload & session status for AI_Bot.py and overseer.py."""
   tmp_file = f"{STATE_FILE}.tmp"
   payload = {
       "vram_offloaded": offloaded,
       "reason": reason,
+      "session_minutes": session_minutes,
+      "session_milestone": session_milestone,
       "timestamp": time.time(),
   }
   try:
@@ -155,6 +179,26 @@ def run_lms_command(cmd: list[str], action_label: str) -> bool:
     return False
 
 
+# >>> PASTE STEP B RIGHT HERE <<<
+def get_gpu_temp_c() -> int | None:
+  """Returns current NVIDIA GPU core temp in Celsius, or None if unavailable."""
+  if not NVML_AVAILABLE:
+    return None
+  try:
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+    return int(temp)
+  except pynvml.NVMLError:
+    return None
+  finally:
+    try:
+      pynvml.nvmlShutdown()
+    except pynvml.NVMLError:
+      pass
+# >>> END OF STEP B <<<
+
+
 # ==============================================================================
 # 3. MAIN WATCHER LOOP
 # ==============================================================================
@@ -162,28 +206,85 @@ def main():
   print("[Offloader] Active — watching configured game libraries (1.0s poll)...")
   vram_offloaded = False
   last_game_seen_time = 0.0
+  session_start_time = 0.0
+  sent_2h_milestone = False
+  sent_4h_milestone = False
+  last_state_sync = 0.0
   set_offload_state(False, "Offloader initialized")
 
   while True:
+    now = time.time()
     heavy_active, trigger_source = is_heavy_game_running()
 
     if heavy_active:
-      last_game_seen_time = time.time()
+      last_game_seen_time = now
+
+      # Start a new session clock if none is active (or previous grace period expired)
+      if session_start_time == 0.0:
+        session_start_time = now
+        sent_2h_milestone = False
+        sent_4h_milestone = False
+
+      session_mins = int((now - session_start_time) // 60)
+      milestone = ""
+
+      if SESSION_REMINDER_ENABLED:
+        if session_mins >= SESSION_ESCALATE_MINS and not sent_4h_milestone:
+          milestone = "4h"
+          sent_4h_milestone = True
+        elif session_mins >= SESSION_REMARK_MINS and not sent_2h_milestone:
+          milestone = "2h"
+          sent_2h_milestone = True
+
       if not vram_offloaded:
         print(f"[Offloader] Heavy game detected: {trigger_source}")
         if run_lms_command(UNLOAD_CMD, "VRAM/RAM Unload"):
           vram_offloaded = True
-          set_offload_state(True, f"Unloaded for {trigger_source}")
+          set_offload_state(
+              True, f"Unloaded for {trigger_source}", session_mins, milestone
+          )
+          last_state_sync = now
+      elif milestone or (now - last_state_sync >= 60.0):
+        # Update session_minutes every 60s (or immediately when a milestone hits)
+        set_offload_state(
+            True, f"Unloaded for {trigger_source}", session_mins, milestone
+        )
+        last_state_sync = now
 
     else:
-      if vram_offloaded and (
-          time.time() - last_game_seen_time >= RELOAD_COOLDOWN_SEC
+      # Reset the session timer only after the crash/update grace period expires
+      if session_start_time > 0.0 and (
+          now - last_game_seen_time >= SESSION_GRACE_SEC
       ):
-        print(f"[Offloader] Game closed and {RELOAD_COOLDOWN_SEC:.0f}s cooldown passed.")
-        if AUTO_RELOAD_ENABLED:
-          run_lms_command(RELOAD_CMD, "VRAM/RAM Reload")
-        vram_offloaded = False
-        set_offload_state(False, "Game exited; VRAM/RAM clear")
+        session_start_time = 0.0
+        sent_2h_milestone = False
+        sent_4h_milestone = False
+
+      if vram_offloaded and (now - last_game_seen_time >= RELOAD_COOLDOWN_SEC):
+        gpu_temp = get_gpu_temp_c()
+        active_mins = (
+            int((now - session_start_time) // 60)
+            if session_start_time > 0.0
+            else 0
+        )
+
+        # Hold reload if GPU is still heat-soaked above RELOAD_MAX_GPU_TEMP_C
+        if gpu_temp is not None and gpu_temp > RELOAD_MAX_GPU_TEMP_C:
+          set_offload_state(
+              True,
+              f"Cooling down ({gpu_temp}°C > {RELOAD_MAX_GPU_TEMP_C}°C target)",
+              active_mins,
+          )
+        else:
+          temp_note = f" (GPU at {gpu_temp}°C)" if gpu_temp is not None else ""
+          print(
+              f"[Offloader] Game closed, {RELOAD_COOLDOWN_SEC:.0f}s cooldown"
+              f" passed{temp_note}."
+          )
+          if AUTO_RELOAD_ENABLED:
+            run_lms_command(RELOAD_CMD, "VRAM/RAM Reload")
+          vram_offloaded = False
+          set_offload_state(False, "Game exited; VRAM/RAM clear", 0, "")
 
     time.sleep(POLL_INTERVAL_SEC)
 

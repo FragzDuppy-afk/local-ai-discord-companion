@@ -9,6 +9,8 @@ presets/static.json
 offloader_state.json
 *.log
 *.db
+*.db-wal
+*.db-shm
 
 # Local Audio Easter Eggs
 Sounds/*.mp3
