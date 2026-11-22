@@ -1,0 +1,21 @@
+# Secrets & Local Config
+.env
+games_config.json
+
+# Private Character Presets (keeps static.json local while allowing default.json)
+presets/static.json
+
+# Runtime State & Logs
+offloader_state.json
+*.log
+*.db
+
+# Local Audio Easter Eggs
+Sounds/*.mp3
+Sounds/*.wav
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+venv/
+.venv/

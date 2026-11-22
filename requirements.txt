@@ -1,0 +1,6 @@
+discord.py[voice]
+openai
+psutil
+nvidia-ml-py
+ddgs
+python-dotenv

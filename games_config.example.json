@@ -1,0 +1,27 @@
+{
+  "watched_game_dirs": [
+    "c:\\program files (x86)\\steam\\steamapps\\common",
+    "d:\\steamlibrary\\steamapps\\common",
+    "c:\\xboxgames",
+    "d:\\xboxgames"
+  ],
+  "whitelisted_folders": [
+    "steamworks shared",
+    "screenshots",
+    "wallpaper_engine",
+    "wallpaper engine"
+  ],
+  "whitelisted_exes": [
+    "gamelaunchhelper.exe",
+    "minecraftlauncher.exe",
+    "minecraft.windows.exe",
+    "robloxplayerbeta.exe",
+    "crashpad_handler.exe",
+    "unitycrashhandler64.exe",
+    "codcrashhandler.exe",
+    "bootstrappercrashhandler.exe"
+  ],
+  "heavy_standalone_exes": [
+    "javaw.exe"
+  ]
+}
