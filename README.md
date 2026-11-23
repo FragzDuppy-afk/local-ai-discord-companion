@@ -8,7 +8,7 @@ Running a local LLM on a daily-driver gaming PC usually creates a conflict: eith
 This suite splits responsibilities across three lightweight Python services that communicate through a shared atomic JSON state file (`offloader_state.json`) and a local SQLite telemetry database (`telemetry_db.py`):
 * **`ai_bot.py` (Core Discord Companion):** Handles natural conversation, live DuckDuckGo web search, real-time weather reports, scheduled Cycle Start/End check-ins, single-fire gaming session break reminders, and dynamic context trimming when GPU VRAM crosses 80%. Intentionally scoped to text generation (with vision projection archived) to preserve 8 GB VRAM headroom and fast response times.
 * **`offloader.py` (Game-Aware VRAM Watchdog & Session Tracker):** Polls active processes every second against your configured game library (`games_config.json`). When a non-whitelisted game launches, it executes `lms unload --all` to free GPU VRAM and System RAM, tracks continuous session time (with a crash/update grace period), and gates automatic model reloads until both the exit cooldown and GPU thermal ceiling (`RELOAD_MAX_GPU_TEMP_C`) pass.
-* **`overseer.py` (Hardware Spike Telemetry):** Monitors sustained GPU VRAM and System RAM spikes (default: ≥ 85% for 10+ seconds), logs 24-hour rolling baselines via SQLite (`telemetry.db`), sends Discord webhook alerts listing top resource consumers (muted automatically during active gaming), and triggers an emergency unload if System RAM reaches critical levels.
+* **`overseer.py` (Hardware Spike Telemetry):** Monitors sustained GPU VRAM and System RAM spikes (default: ≥ 85% for 10+ seconds), logs 24-hour rolling baselines via SQLite (`telemetry.db`), sends Discord webhook alerts listing top resource consumers (muted automatically during active gaming), and triggers an emergency unload if either GPU VRAM or System RAM reaches critical levels.
 
 ---
 
@@ -43,8 +43,10 @@ ai-bot/
 
 ## Quick Setup
 
-### 1. Install Dependencies
+### 1. Register LM Studio CLI & Install Dependencies
+Open a terminal in the project folder, register the `lms` CLI in your Windows PATH once, and install Python packages:
 ```bash
+lms bootstrap
 pip install -r requirements.txt
 ```
 
