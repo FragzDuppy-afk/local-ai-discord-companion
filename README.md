@@ -87,3 +87,12 @@ You can create a new AI persona without modifying Python code:
 1. Duplicate `presets/default.json` (e.g., `presets/my_character.json`).
 2. Customize `bot_name`, `user_title`, `system_prompt`, `transmit_prompt`, `transmit_scenarios`, `fallback_fragments`, and `audio_commands`.
 3. Set `CHARACTER_PRESET=my_character` in your `.env` file and restart the bot.
+
+---
+
+## Troubleshooting First Boot
+
+* **Bot Doesn't Come Online via `Toggle_AI_Bot.bat`:** Because `Toggle_AI_Bot.bat` runs `pythonw.exe` silently in the background, startup errors (like a missing `.env` token or disabled **Message Content Intent** in the Discord Developer Portal) won't show a window. Run `python ai_bot.py` once in a terminal to read the exact startup error.
+* **Model Not Found / Empty Replies:** Ensure `LLM_MODEL` in your `.env` matches an exact model identifier downloaded in LM Studio. Run `lms ls` in your terminal to copy the exact model string.
+* **Offloader Doesn't Trigger for Games on Custom Drives:** By default, `offloader.py` watches standard `C:\` and `D:\` Steam/Xbox paths. If your games are installed on another drive (e.g., `E:\` or `G:\`), copy `games_config.example.json` to `games_config.json` and add your library folder path.
+
