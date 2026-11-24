@@ -21,3 +21,7 @@ __pycache__/
 *.py[cod]
 venv/
 .venv/
+
+# Linux toggle runtime state & logs
+.pids/
+logs/

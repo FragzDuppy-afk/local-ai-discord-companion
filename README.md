@@ -9,7 +9,7 @@ A cross-platform (Windows & Linux), modular, locally hosted Discord AI companion
 Running a local LLM on a daily-driver gaming PC usually creates a conflict: either the model consumes GPU VRAM and System RAM while you game, or you have to manually open LM Studio and unload models every time you launch a heavy title.
 
 This suite splits responsibilities across three lightweight Python services that communicate through a shared atomic JSON state file (`offloader_state.json`) and a local SQLite telemetry database (`telemetry_db.py`):
-* **`AI_Bot.py` (Core Discord Companion):** Handles natural conversation, live DuckDuckGo web search, real-time weather reports, scheduled Cycle Start/End check-ins, single-fire gaming session break reminders, and dynamic context trimming when GPU VRAM crosses 80%. Intentionally scoped to text generation (with vision projection archived) to preserve 8 GB VRAM headroom and fast response times.
+* **`AI_Bot.py` (Core Discord Companion):** Handles natural conversation, intent-routed DuckDuckGo web search (with query sanitization, two-step regional retailer fallback, and strict anti-hallucination guardrails), real-time weather reports, scheduled Cycle Start/End check-ins, single-fire gaming session break reminders, and dynamic context trimming when GPU VRAM crosses 80%. Intentionally scoped to text generation (with vision projection archived) to preserve 8 GB VRAM headroom and fast response times.
 * **`offloader.py` (Game-Aware VRAM Watchdog & Session Tracker):** Polls active processes every second against your configured game library (`games_config.json`, supporting both Windows libraries and Linux Steam/Proton paths). When a non-whitelisted game launches, it executes `lms unload --all` to free GPU VRAM and System RAM, tracks continuous session time (with a crash/update grace period), and gates automatic model reloads until both the exit cooldown and GPU thermal ceiling (`RELOAD_MAX_GPU_TEMP_C`) pass.
 * **`Overseer.py` (Hardware Spike Telemetry):** Monitors sustained GPU VRAM and System RAM spikes (default: ≥ 85% for 10+ seconds), logs 24-hour rolling baselines via SQLite (`telemetry.db`), sends Discord webhook alerts listing top resource consumers (muted automatically during active gaming), and triggers an emergency unload if either GPU VRAM or System RAM reaches critical levels.
 
@@ -142,11 +142,14 @@ cp games_config.example.json games_config.json
 ---
 
 ## Discord Commands
+* **`!help`**: Displays the command directory, including core system commands and any preset-specific audio commands.
 * **`!status`**: Displays a live hardware manifest (CPU load, System RAM, GPU VRAM, 24-hour rolling baseline status, free primary drive space, and AI backend state).
+* **`!clear`**: Flushes short-term conversation memory (`chat_history`) back to the system prompt for a clean context slate.
+* **`!search <query>`**: Forces a live DuckDuckGo web search on any exact topic, part number, or phrase.
 * **`!transmit`**: Generates an atmospheric 2-paragraph dispatch using your active preset's prompt scenarios (falls back to cached logs if VRAM is constrained).
 * **`!screenoff`**: Powers down connected displays (`WM_SYSCOMMAND` on Windows; `xset dpms force off` on Linux X11 sessions).
 * **Custom Audio Commands**: Any command mapped under `"audio_commands"` in your active preset (e.g., `!chime` in `default.json`) joins your active voice channel and plays the corresponding `.mp3` from `Sounds/`.
-* **Natural Chat, Weather & Web Search**: Mention words like `weather` or `forecast` for live telemetry, or ask the bot to `search` / `look up` current topics via DuckDuckGo.
+* **Natural Chat, Weather & Web Search**: Mention words like `weather` or `forecast` for live telemetry, or ask natural location/availability questions (including 5-digit ZIP codes) to automatically trigger sanitized DuckDuckGo lookups.
 
 ---
 

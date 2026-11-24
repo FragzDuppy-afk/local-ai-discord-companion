@@ -42,10 +42,15 @@ _games_cfg = load_games_config()
 WATCHED_GAME_DIRS = _games_cfg.get(
     "watched_game_dirs",
     [
+        # Windows default libraries
         r"c:\program files (x86)\steam\steamapps\common",
         r"d:\steamlibrary\steamapps\common",
         r"c:\xboxgames",
         r"d:\xboxgames",
+        # Linux native & Flatpak Steam libraries (Proton games also run from here)
+        "~/.local/share/Steam/steamapps/common",
+        "~/.steam/debian-installation/steamapps/common",
+        "~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common",
     ],
 )
 WHITELISTED_FOLDERS = {
@@ -115,10 +120,10 @@ def set_offload_state(
 
 
 def normalize_path(path_str: str) -> str:
-  """Normalizes and lowercases Windows paths safely."""
+  """Expands user home (~), normalizes separators, and lowercases paths for Windows & Linux."""
   if not path_str:
     return ""
-  return os.path.normpath(path_str).lower()
+  return os.path.normpath(os.path.expanduser(path_str)).lower()
 
 
 def is_heavy_game_running() -> tuple[bool, str]:

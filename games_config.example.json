@@ -3,7 +3,10 @@
     "c:\\program files (x86)\\steam\\steamapps\\common",
     "d:\\steamlibrary\\steamapps\\common",
     "c:\\xboxgames",
-    "d:\\xboxgames"
+    "d:\\xboxgames",
+    "~/.local/share/Steam/steamapps/common",
+    "~/.steam/debian-installation/steamapps/common",
+    "~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common"
   ],
   "whitelisted_folders": [
     "steamworks shared",
@@ -22,6 +25,7 @@
     "bootstrappercrashhandler.exe"
   ],
   "heavy_standalone_exes": [
-    "javaw.exe"
+    "javaw.exe",
+    "java"
   ]
 }
