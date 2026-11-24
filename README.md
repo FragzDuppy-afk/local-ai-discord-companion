@@ -1,3 +1,6 @@
+[![Unit Tests](https://github.com)](https://github.com)
+
+
 # Local AI Companion & Hardware Telemetry Suite
 
 A modular, locally hosted Discord AI companion powered by **LM Studio**, paired with an automated game-aware VRAM offloader and a real-time hardware spike monitor.
@@ -6,9 +9,41 @@ A modular, locally hosted Discord AI companion powered by **LM Studio**, paired 
 Running a local LLM on a daily-driver gaming PC usually creates a conflict: either the model consumes GPU VRAM and System RAM while you game, or you have to manually open LM Studio and unload models every time you launch a heavy title.
 
 This suite splits responsibilities across three lightweight Python services that communicate through a shared atomic JSON state file (`offloader_state.json`) and a local SQLite telemetry database (`telemetry_db.py`):
-* **`ai_bot.py` (Core Discord Companion):** Handles natural conversation, live DuckDuckGo web search, real-time weather reports, scheduled Cycle Start/End check-ins, single-fire gaming session break reminders, and dynamic context trimming when GPU VRAM crosses 80%. Intentionally scoped to text generation (with vision projection archived) to preserve 8 GB VRAM headroom and fast response times.
+* **`AI_Bot.py` (Core Discord Companion):** Handles natural conversation, live DuckDuckGo web search, real-time weather reports, scheduled Cycle Start/End check-ins, single-fire gaming session break reminders, and dynamic context trimming when GPU VRAM crosses 80%. Intentionally scoped to text generation (with vision projection archived) to preserve 8 GB VRAM headroom and fast response times.
 * **`offloader.py` (Game-Aware VRAM Watchdog & Session Tracker):** Polls active processes every second against your configured game library (`games_config.json`). When a non-whitelisted game launches, it executes `lms unload --all` to free GPU VRAM and System RAM, tracks continuous session time (with a crash/update grace period), and gates automatic model reloads until both the exit cooldown and GPU thermal ceiling (`RELOAD_MAX_GPU_TEMP_C`) pass.
-* **`overseer.py` (Hardware Spike Telemetry):** Monitors sustained GPU VRAM and System RAM spikes (default: ≥ 85% for 10+ seconds), logs 24-hour rolling baselines via SQLite (`telemetry.db`), sends Discord webhook alerts listing top resource consumers (muted automatically during active gaming), and triggers an emergency unload if either GPU VRAM or System RAM reaches critical levels.
+* **`Overseer.py` (Hardware Spike Telemetry):** Monitors sustained GPU VRAM and System RAM spikes (default: ≥ 85% for 10+ seconds), logs 24-hour rolling baselines via SQLite (`telemetry.db`), sends Discord webhook alerts listing top resource consumers (muted automatically during active gaming), and triggers an emergency unload if either GPU VRAM or System RAM reaches critical levels.
+
+### System Data & Control Flow
+
+```mermaid
+flowchart LR
+    subgraph Watchdogs ["Background Daemons"]
+        OFF["offloader.py<br/>(1s Process & GPU Temp Poll)"]
+        OVR["Overseer.py<br/>(2s RAM/VRAM Spike & Drift)"]
+    end
+
+    subgraph IPC ["Crash-Safe State & Storage"]
+        JSON[("offloader_state.json<br/>(Atomic os.replace IPC)")]
+        DB[("telemetry.db<br/>(SQLite WAL + Alert Queue)")]
+    end
+
+    subgraph Core ["Inference & Alerts"]
+        BOT["AI_Bot.py<br/>(Discord Client + Hysteresis)"]
+        LMS["LM Studio CLI / Server<br/>(Port 1234)"]
+        DISC["Discord Channel & Webhooks"]
+    end
+
+    OFF -- "Atomic Write" --> JSON
+    JSON -- "Read State / Mute Drift" --> OVR
+    JSON -- "Read Offload Status" --> BOT
+    OVR -- "Log Samples & Queue Alerts" --> DB
+    DB -- "24h Rolling Baseline" --> BOT
+    OVR -- "Store-and-Forward Embeds" --> DISC
+    OFF -- "Unload / Thermal-Gated Reload" --> LMS
+    BOT -- "Async Inference & Context Trim" --> LMS
+    BOT -- "!status / Chat / Milestones" --> DISC
+```
+
 
 ---
 
@@ -16,9 +51,9 @@ This suite splits responsibilities across three lightweight Python services that
 
 ```text
 ai-bot/
-├── ai_bot.py                   # Core Discord bot & LM Studio client
+├── AI_Bot.py                   # Core Discord bot & LM Studio client
 ├── offloader.py                # Automated game detector, thermal reload gate & session timer
-├── overseer.py                 # Sustained RAM/VRAM spike & rolling baseline daemon
+├── Overseer.py                 # Sustained RAM/VRAM spike & rolling baseline daemon
 ├── telemetry_db.py             # SQLite WAL telemetry & offline alert queue helper
 ├── Toggle_AI_Bot.bat           # One-click Windows start/stop background toggle
 ├── requirements.txt            # Python dependencies
@@ -26,8 +61,10 @@ ai-bot/
 ├── games_config.example.json   # Game library & whitelist template
 ├── presets/
 │   └── default.json            # Default "Atlas" character preset
-└── Sounds/
-    └── .gitkeep                # Optional folder for local voice-channel audio clips
+├── Sounds/
+│   └── .gitkeep                # Optional folder for local voice-channel audio clips
+└── tests/
+    └── test_telemetry_and_offloader.py  # Unit tests for SQLite WAL & atomic IPC
 ```
 
 ---
@@ -68,8 +105,8 @@ copy games_config.example.json games_config.json
 ```
 
 ### 4. Run the Suite
-* **One-Click Background Toggle (Windows):** Double-click `Toggle_AI_Bot.bat` to launch `offloader.py`, `overseer.py`, and `ai_bot.py` silently via `pythonw.exe`. Double-click it again to stop all three processes cleanly.
-* **Manual / Terminal Mode:** Run each script in its own terminal window (`python ai_bot.py`, `python offloader.py`, `python overseer.py`).
+* **One-Click Background Toggle (Windows):** Double-click `Toggle_AI_Bot.bat` to launch `offloader.py`, `Overseer.py`, and `AI_Bot.py` silently via `pythonw.exe`. Double-click it again to stop all three processes cleanly.
+* **Manual / Terminal Mode:** Run each script in its own terminal window (`python AI_Bot.py`, `python offloader.py`, `python Overseer.py`).
 
 ---
 
@@ -92,7 +129,7 @@ You can create a new AI persona without modifying Python code:
 
 ## Troubleshooting First Boot
 
-* **Bot Doesn't Come Online via `Toggle_AI_Bot.bat`:** Because `Toggle_AI_Bot.bat` runs `pythonw.exe` silently in the background, startup errors (like a missing `.env` token or disabled **Message Content Intent** in the Discord Developer Portal) won't show a window. Run `python ai_bot.py` once in a terminal to read the exact startup error.
+* **Bot Doesn't Come Online via `Toggle_AI_Bot.bat`:** Because `Toggle_AI_Bot.bat` runs `pythonw.exe` silently in the background, startup errors (like a missing `.env` token or disabled **Message Content Intent** in the Discord Developer Portal) won't show a window. Run `python AI_Bot.py` once in a terminal to read the exact startup error.
 * **Model Not Found / Empty Replies:** Ensure `LLM_MODEL` in your `.env` matches an exact model identifier downloaded in LM Studio. Run `lms ls` in your terminal to copy the exact model string.
 * **Offloader Doesn't Trigger for Games on Custom Drives:** By default, `offloader.py` watches standard `C:\` and `D:\` Steam/Xbox paths. If your games are installed on another drive (e.g., `E:\` or `G:\`), copy `games_config.example.json` to `games_config.json` and add your library folder path.
 
