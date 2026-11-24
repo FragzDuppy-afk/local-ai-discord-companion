@@ -1,6 +1,7 @@
 from datetime import datetime
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -156,30 +157,74 @@ def get_top_ram_processes(limit: int = 3) -> str:
 
 
 def get_top_vram_processes(handle, limit: int = 3) -> str:
-  """Finds the top GPU VRAM consumers via NVML."""
-  if not NVML_AVAILABLE or handle is None:
-    return "• NVML unavailable"
-  try:
-    nv_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(
-        handle
-    ) + pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
-    merged = {}
-    for item in nv_procs:
-      used_mb = (item.usedGpuMemory or 0) / (1024**2)
-      try:
-        name = psutil.Process(item.pid).name()
-      except (psutil.NoSuchProcess, psutil.AccessDenied):
-        name = f"PID {item.pid}"
-      merged[name] = max(merged.get(name, 0.0), used_mb)
+  """Finds top GPU VRAM consumers via NVML, falling back to Windows PDH counters."""
+  # 1. Try NVML first
+  if NVML_AVAILABLE and handle is not None:
+    try:
+      nv_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(
+          handle
+      ) + pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
+      merged = {}
+      for item in nv_procs:
+        used_mb = (item.usedGpuMemory or 0) / (1024**2)
+        if used_mb > 0:
+          try:
+            name = psutil.Process(item.pid).name()
+          except (psutil.NoSuchProcess, psutil.AccessDenied):
+            name = f"PID {item.pid}"
+          merged[name] = max(merged.get(name, 0.0), used_mb)
 
-    sorted_gpu = sorted(merged.items(), key=lambda x: x[1], reverse=True)
-    if not sorted_gpu:
-      return "• No active GPU processes reported"
-    return "\n".join(
-        f"• {name}: {mb:.0f} MB" for name, mb in sorted_gpu[:limit]
-    )
-  except pynvml.NVMLError:
-    return "• Could not query GPU processes"
+      if merged:
+        sorted_gpu = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+        return "\n".join(
+            f"• {name}: {mb:.0f} MB" for name, mb in sorted_gpu[:limit]
+        )
+    except pynvml.NVMLError:
+      pass
+
+  # 2. Windows WDDM Fallback via PowerShell PDH GPU Process Memory counters
+  if os.name == "nt":
+    try:
+      cmd = [
+          "powershell",
+          "-NoProfile",
+          "-Command",
+          r"(Get-Counter '\GPU Process Memory(*)\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Select-Object InstanceName, CookedValue | ConvertTo-Json",
+      ]
+      res = subprocess.run(
+          cmd,
+          capture_output=True,
+          text=True,
+          timeout=4,
+          creationflags=subprocess.CREATE_NO_WINDOW,
+      )
+      if res.returncode == 0 and res.stdout.strip():
+        samples = json.loads(res.stdout)
+        if isinstance(samples, dict):
+          samples = [samples]
+        merged = {}
+        for s in samples:
+          mb = float(s.get("CookedValue", 0)) / (1024**2)
+          if mb < 1.0:
+            continue
+          match = re.search(r"pid_(\d+)_", s.get("InstanceName", ""))
+          if match:
+            pid = int(match.group(1))
+            try:
+              name = psutil.Process(pid).name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+              name = f"PID {pid}"
+            merged[name] = merged.get(name, 0.0) + mb
+
+        if merged:
+          sorted_gpu = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+          return "\n".join(
+              f"• {name}: {mb:.0f} MB" for name, mb in sorted_gpu[:limit]
+          )
+    except Exception:
+      pass
+
+  return "• No active GPU VRAM consumers reported"
 
 
 # ==============================================================================
