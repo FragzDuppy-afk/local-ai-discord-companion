@@ -13,22 +13,39 @@ from ddgs import DDGS
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
+import socket
 from openai import OpenAI
 import psutil
-import pynvml
 import telemetry_db
+
+# Gracefully handle systems without NVIDIA drivers/libraries (matches Overseer.py)
+try:
+  import pynvml
+  NVML_AVAILABLE = True
+except ImportError:
+  NVML_AVAILABLE = False
 
 load_dotenv()
 
 # ==============================================================================
-# SINGLE-INSTANCE GUARD (PREVENTS DUPLICATE BOT PROCESSES)
+# SINGLE-INSTANCE GUARD (PREVENTS DUPLICATE BOT PROCESSES ON WINDOWS & LINUX)
 # ==============================================================================
-_mutex = ctypes.windll.kernel32.CreateMutexW(
-    None, False, "LocalAIBotSingleInstanceMutex"
-)
-if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-  print("[LOCK] AI Bot is already running in the background. Exiting duplicate.")
-  sys.exit(0)
+if os.name == "nt":
+  _mutex = ctypes.windll.kernel32.CreateMutexW(
+      None, False, "LocalAIBotSingleInstanceMutex"
+  )
+  if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    print("[LOCK] AI Bot is already running in the background. Exiting duplicate.")
+    sys.exit(0)
+else:
+  # On Linux/macOS, binding a local ephemeral port acts as an OS-managed mutex
+  # that automatically releases even if the process is killed (SIGKILL).
+  _instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  try:
+    _instance_socket.bind(("127.0.0.1", 49152))
+  except socket.error:
+    print("[LOCK] AI Bot is already running in the background. Exiting duplicate.")
+    sys.exit(0)
 
 # ==============================================================================
 # CONFIGURATION & THRESHOLDS
@@ -51,10 +68,11 @@ if not DISCORD_TOKEN or CHANNEL_ID == 0:
   sys.exit(1)
 
 # Dynamic VRAM percentage thresholds (scales automatically to any GPU size)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RELAXED_VRAM_PERCENT = 80.0
 PAUSE_VRAM_PERCENT = 90.0
 RESUME_VRAM_PERCENT = 70.0
-SOUNDS_FOLDER = "Sounds"
+SOUNDS_FOLDER = os.path.join(BASE_DIR, "Sounds")
 SESSION_ALERTS_ENABLED = (
     os.getenv("SESSION_ALERTS_ENABLED", "true").strip().lower() == "true"
 )
@@ -222,23 +240,43 @@ last_handled_milestone = ""
 # ==============================================================================
 
 
+# Reusable subprocess flag: hides console popups on Windows, evaluates to 0 on Linux
+NO_WINDOW_FLAG = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
 def get_gpu_vram_stats() -> dict:
-  """Queries total GPU VRAM usage directly via NVML as a dynamic percentage."""
+  """Queries total GPU VRAM usage and core temp directly via NVML."""
+  if not NVML_AVAILABLE:
+    return {"used_gb": 0.0, "total_gb": 0.0, "percent": 0.0, "temp_c": None}
   try:
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(0)
     mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    temp_c = int(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
     used_gb = round(mem.used / (1024**3), 2)
     total_gb = round(mem.total / (1024**3), 2)
     percent = round((mem.used / mem.total) * 100.0, 1)
-    return {"used_gb": used_gb, "total_gb": total_gb, "percent": percent}
-  except pynvml.NVMLError:
-    return {"used_gb": 0.0, "total_gb": 0.0, "percent": 0.0}
+    return {"used_gb": used_gb, "total_gb": total_gb, "percent": percent, "temp_c": temp_c}
+  except Exception:
+    return {"used_gb": 0.0, "total_gb": 0.0, "percent": 0.0, "temp_c": None}
   finally:
     try:
       pynvml.nvmlShutdown()
-    except pynvml.NVMLError:
+    except Exception:
       pass
+
+
+def unload_vram():
+  """Unloads active LM Studio models to immediately free GPU VRAM."""
+  try:
+    subprocess.run(
+        ["lms", "unload", "--all"],
+        creationflags=NO_WINDOW_FLAG,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+  except Exception:
+    pass
 
 
 def unload_vram():
@@ -258,7 +296,8 @@ def get_system_status():
   """Builds the formatted hardware manifest for the !status Discord command."""
   cpu = psutil.cpu_percent(interval=0.5)
   ram = psutil.virtual_memory()
-  disk = psutil.disk_usage("C:\\")
+  # Evaluates to "C:\\" on Windows and "/" on Linux
+  disk = psutil.disk_usage(os.path.abspath(os.sep))
   vram = get_gpu_vram_stats()
   baseline = telemetry_db.get_rolling_baseline(24.0)
 
@@ -389,7 +428,7 @@ def generate_hybrid_transmission() -> str:
         print(f"[TRANSMIT RECOVERY] Waking LM Studio server ({e})...")
         subprocess.run(
             ["lms", "server", "start", "--port", LM_STUDIO_PORT],
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=NO_WINDOW_FLAG,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -432,9 +471,20 @@ def ask_static(user_text):
   """Sends prompt to LM Studio with dynamic VRAM context-trimming protection."""
   global relaxed_mode
   vram = get_gpu_vram_stats()
+  temp_c = vram.get("temp_c")
 
+  # Classify live hardware condition so reactive presets (like Vesper) can shift tone
+  if vram["percent"] >= RELAXED_VRAM_PERCENT or (temp_c is not None and temp_c >= 72):
+    hw_state = "STRAINED"
+  elif vram["percent"] >= 65.0 or (temp_c is not None and temp_c >= 62):
+    hw_state = "WARM"
+  else:
+    hw_state = "NOMINAL"
+
+  temp_str = f" | GPU Temp: {temp_c}°C" if temp_c is not None else ""
   now_str = datetime.now().strftime("%A, %I:%M %p")
-  chat_history.append({"role": "user", "content": f"[Current Time: {now_str}] {user_text}"})
+  telemetry_tag = f"[Current Time: {now_str} | VRAM: {vram['percent']}%{temp_str} | State: {hw_state}]"
+  chat_history.append({"role": "user", "content": f"{telemetry_tag} {user_text}"})
 
 
   # Dynamic Relaxed Mode: shrink history window when VRAM hits >= 80%
@@ -465,10 +515,10 @@ def ask_static(user_text):
         model = LLM_MODEL, messages=chat_history, temperature=0.7
     )
   except Exception as api_err:
-    print(f"[LM STUDIO RECOVERY] Server unreachable ({api_err}) — restarting port 1234...")
+    print(f"[LM STUDIO RECOVERY] Server unreachable ({api_err}) — restarting port {LM_STUDIO_PORT}...")
     subprocess.run(
         ["lms", "server", "start", "--port", LM_STUDIO_PORT],
-        creationflags=subprocess.CREATE_NO_WINDOW,
+        creationflags=NO_WINDOW_FLAG,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -605,8 +655,17 @@ async def on_message(message):
   if message.content.strip().lower() == "!screenoff":
     await message.channel.send(f"Powering down display signal, {USER_TITLE}.")
     await asyncio.sleep(1)
-    # 0xFFFF = All monitors, 0x0112 = WM_SYSCOMMAND, 0xF170 = SC_MONITORPOWER, 2 = Off
-    ctypes.windll.user32.PostMessageW(0xFFFF, 0x0112, 0xF170, 2)
+    if os.name == "nt":
+      # 0xFFFF = All monitors, 0x0112 = WM_SYSCOMMAND, 0xF170 = SC_MONITORPOWER, 2 = Off
+      ctypes.windll.user32.PostMessageW(0xFFFF, 0x0112, 0xF170, 2)
+    else:
+      # Linux X11 DPMS fallback (Wayland compositors restrict external display power-off)
+      try:
+        subprocess.run(["xset", "dpms", "force", "off"], check=True)
+      except Exception:
+        await message.channel.send(
+            f"⚠️ Display power control is unavailable in this Linux session, {USER_TITLE}."
+        )
     return
   cmd = message.content.strip().lower()
 

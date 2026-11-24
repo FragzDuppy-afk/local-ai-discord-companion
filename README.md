@@ -61,7 +61,8 @@ ai-bot/
 ├── .env.example                # Environment variable template
 ├── games_config.example.json   # Cross-platform game library & whitelist template
 ├── presets/
-│   └── default.json            # Default "Atlas" character preset
+│   ├── default.json            # Default "Atlas" character preset
+│   └── vesper.json             # Alternate hardware-reactive dual-voice "Vesper" preset
 ├── Sounds/
 │   └── .gitkeep                # Optional folder for local voice-channel audio clips
 └── tests/
@@ -149,11 +150,15 @@ cp games_config.example.json games_config.json
 
 ---
 
-## Creating Custom Character Presets
-You can create a new AI persona without modifying Python code:
-1. Duplicate `presets/default.json` (e.g., `presets/my_character.json`).
-2. Customize `bot_name`, `user_title`, `system_prompt`, `transmit_prompt`, `transmit_scenarios`, `fallback_fragments`, and `audio_commands`.
-3. Set `CHARACTER_PRESET=my_character` in your `.env` file and restart the bot. *(Note: On Linux, ensure preset and `Sounds/` filenames match exact uppercase/lowercase spelling.)*
+## Character Presets & Custom Personas
+The project includes two built-in options in `presets/`:
+* **`default` (Atlas):** Standard steady AI assistant preset.
+* **`vesper` (Vesper):** Hardware-reactive dual-voice preset that shifts persona based on GPU temperature, VRAM status, and time. Enable it by setting `CHARACTER_PRESET=vesper` in your `.env`.
+
+To create a custom persona without touching Python code:
+1. Duplicate an existing preset (e.g., `presets/my_character.json`).
+2. Modify key configuration fields (`bot_name`, `system_prompt`, `transmit_scenarios`, etc.).
+3. Update `CHARACTER_PRESET=my_character` in your `.env` file and restart (case-sensitive on Linux).
 
 ---
 
