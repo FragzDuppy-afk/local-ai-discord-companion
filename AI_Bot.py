@@ -55,6 +55,11 @@ RELAXED_VRAM_PERCENT = 80.0
 PAUSE_VRAM_PERCENT = 90.0
 RESUME_VRAM_PERCENT = 70.0
 SOUNDS_FOLDER = "Sounds"
+SESSION_ALERTS_ENABLED = (
+    os.getenv("SESSION_ALERTS_ENABLED", "true").strip().lower() == "true"
+)
+
+
 # ==============================================================================
 # CHARACTER PRESET LOADER (LOADS FROM presets/<CHARACTER_PRESET>.json)
 # ==============================================================================
@@ -157,7 +162,6 @@ def get_gaming_offload_notice() -> str | None:
     return None
 
 
-# >>> PASTE THIS HELPER RIGHT HERE <<<
 def check_session_milestone() -> str | None:
   """Reads offloader_state.json for single-fire 2h/4h gaming session milestones."""
   global last_handled_milestone
@@ -196,26 +200,21 @@ def check_session_milestone() -> str | None:
     pass
 
   return None
-# >>> END OF HELPER <<<
 
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
+llm_lock = asyncio.Lock()
+
 
 sent_end_today = False
 pending_cycle_end = False
 game_paused = False
 relaxed_mode = False
 startup_sent = False
-
-# >>> PASTE STEP A RIGHT HERE <<<
-SESSION_ALERTS_ENABLED = (
-    os.getenv("SESSION_ALERTS_ENABLED", "true").strip().lower() == "true"
-)
 last_handled_milestone = ""
-# >>> END OF STEP A <<<
 
 
 # ==============================================================================
@@ -271,7 +270,6 @@ def get_system_status():
   ram_avg_str = f" (24h Avg: {baseline['avg_ram']}%)" if has_baseline else ""
   vram_avg_str = f" (24h Avg: {baseline['avg_vram']}%)" if has_baseline else ""
 
-  # Dynamic status remarks
   cpu_remark = (
       "NOMINAL" if cpu < 75 else "ELEVATED — Check background processes"
   )
@@ -344,29 +342,61 @@ def fetch_web_search(query):
       print(f"[SEARCH WARNING] Backend '{b}' failed: {e}")
   return "Live search temporarily unavailable."
 
+last_transmit_scenario = ""
+last_fallback_fragment = ""
+
+
 def generate_hybrid_transmission() -> str:
   """Generates a fresh AI Iterator transmission when VRAM < 80%, or uses archive fallback."""
+  global last_transmit_scenario, last_fallback_fragment
   vram = get_gpu_vram_stats()
 
-  if game_paused or vram["percent"] >= RELAXED_VRAM_PERCENT:
-    return random.choice(FALLBACK_FRAGMENTS)
-
-  try:
-    scenario = random.choice(TRANSMIT_SCENARIOS)
-    res = llm.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": TRANSMIT_GENERATOR_PROMPT},
-            {"role": "user", "content": scenario},
-        ],
-        temperature=0.72,
-        max_tokens=900,
+  def _pick_unique_fallback() -> str:
+    global last_fallback_fragment
+    choices = (
+        [f for f in FALLBACK_FRAGMENTS if f != last_fallback_fragment]
+        or FALLBACK_FRAGMENTS
     )
-    fragment = (res.choices[0].message.content or "").strip()
-    return fragment if fragment else random.choice(FALLBACK_FRAGMENTS)
-  except Exception as e:
-    print(f"[TRANSMIT FALLBACK] {e}")
-    return random.choice(FALLBACK_FRAGMENTS)
+    picked = random.choice(choices)
+    last_fallback_fragment = picked
+    return picked
+
+  if game_paused or vram["percent"] >= RELAXED_VRAM_PERCENT:
+    return _pick_unique_fallback()
+
+  scenarios = (
+      [s for s in TRANSMIT_SCENARIOS if s != last_transmit_scenario]
+      or TRANSMIT_SCENARIOS
+  )
+  scenario = random.choice(scenarios)
+  last_transmit_scenario = scenario
+
+  for attempt in range(2):
+    try:
+      res = llm.chat.completions.create(
+          model=LLM_MODEL,
+          messages=[
+              {"role": "system", "content": TRANSMIT_GENERATOR_PROMPT},
+              {"role": "user", "content": scenario},
+          ],
+          temperature=0.88,
+          max_tokens=900,
+      )
+      fragment = (res.choices[0].message.content or "").strip()
+      return fragment if fragment else _pick_unique_fallback()
+    except Exception as e:
+      if attempt == 0:
+        print(f"[TRANSMIT RECOVERY] Waking LM Studio server ({e})...")
+        subprocess.run(
+            ["lms", "server", "start", "--port", LM_STUDIO_PORT],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(3)
+      else:
+        print(f"[TRANSMIT FALLBACK] {e}")
+        return _pick_unique_fallback()
 
 
 
@@ -474,7 +504,6 @@ async def system_monitor():
   vram = await asyncio.to_thread(get_gpu_vram_stats)
   vram_pct = vram["percent"]
 
-  # Update relaxed mode flag dynamically every 20 seconds
   relaxed_mode = RELAXED_VRAM_PERCENT <= vram_pct < PAUSE_VRAM_PERCENT
 
   # Hysteresis pause check: pause when offloader is active or VRAM >= 90%, resume below 70%
@@ -498,19 +527,27 @@ async def system_monitor():
     print(f"GPU demand cleared ({vram_pct}% GPU VRAM) — AI Bot resumed.")
     if pending_cycle_end and channel:
       pending_cycle_end = False
-      reply = await asyncio.to_thread(ask_static, "[SYSTEM: Cycle End triggered after game session. Deliver your nighttime broadcast.]")
+      async with llm_lock:
+        reply = await asyncio.to_thread(
+            ask_static,
+            "[SYSTEM: Cycle End triggered after game session. Deliver your nighttime broadcast.]",
+        )
       await channel.send(reply[:1950])
 
   if now.hour == 0 and now.minute == 0:
     sent_end_today = False
     pending_cycle_end = False
 
-  if now.hour == CYCLE_END_HOUR and now.minute == 0 and not sent_end_today:
+  if now.hour == CYCLE_END_HOUR and now.minute < 5 and not sent_end_today:
     sent_end_today = True
     if game_paused:
       pending_cycle_end = True
     elif channel:
-      reply = await asyncio.to_thread(ask_static, "[SYSTEM: Cycle End triggered. Deliver your nighttime broadcast.]")
+      async with llm_lock:
+        reply = await asyncio.to_thread(
+            ask_static,
+            "[SYSTEM: Cycle End triggered. Deliver your nighttime broadcast.]",
+        )
       await channel.send(reply[:1950])
 
 
@@ -540,7 +577,8 @@ async def on_ready():
       )
       try:
         # Attempt full AI-generated greeting via LM Studio
-        reply = await asyncio.to_thread(ask_static, prompt)
+        async with llm_lock:
+          reply = await asyncio.to_thread(ask_static, prompt)
         await channel.send(reply[:1950])
       except Exception as e:
         # Cold-boot fallback: send direct telemetry + weather if weights are still loading
@@ -583,7 +621,6 @@ async def on_message(message):
     await play_easter_egg_audio(message, track["file"], track["label"])
     return
 
-  # >>> UPDATED BLOCK START >>>
   offload_reply = get_gaming_offload_notice()
   if offload_reply:
     await message.channel.send(offload_reply)
@@ -592,7 +629,6 @@ async def on_message(message):
   if game_paused:
     await message.channel.send(f"Broadcast paused while high GPU demand is active, {USER_TITLE}—I'll resume once VRAM clears.")
     return
-  # <<< UPDATED BLOCK END <<<
 
   async with message.channel.typing():
 
@@ -626,7 +662,8 @@ async def on_message(message):
       print(f"[DEBUG] Search snippet received: {search_info[:100]}...")
       text = f"{text}\n[Live web search results: {search_info}]"
 
-    reply = await asyncio.to_thread(ask_static, text)
+    async with llm_lock:
+      reply = await asyncio.to_thread(ask_static, text)
     await message.channel.send(reply[:1950])
 
 

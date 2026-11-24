@@ -4,6 +4,13 @@ import subprocess
 import time
 from dotenv import load_dotenv
 import psutil
+try:
+  import pynvml
+
+  NVML_AVAILABLE = True
+except ImportError:
+  NVML_AVAILABLE = False
+
 
 load_dotenv()
 
@@ -69,13 +76,6 @@ RELOAD_CMD = ["lms", "load", LLM_MODEL, "--gpu", "max"]
 
 POLL_INTERVAL_SEC = float(os.getenv("OFFLOADER_POLL_INTERVAL", "1.0"))
 RELOAD_COOLDOWN_SEC = float(os.getenv("OFFLOADER_RELOAD_COOLDOWN", "20.0"))
-# Optional NVIDIA GPU thermal check before reloading LLM weights
-try:
-  import pynvml
-
-  NVML_AVAILABLE = True
-except ImportError:
-  NVML_AVAILABLE = False
 
 RELOAD_MAX_GPU_TEMP_C = int(os.getenv("RELOAD_MAX_GPU_TEMP_C", "60"))
 
@@ -179,7 +179,6 @@ def run_lms_command(cmd: list[str], action_label: str) -> bool:
     return False
 
 
-# >>> PASTE STEP B RIGHT HERE <<<
 def get_gpu_temp_c() -> int | None:
   """Returns current NVIDIA GPU core temp in Celsius, or None if unavailable."""
   if not NVML_AVAILABLE:
@@ -196,7 +195,6 @@ def get_gpu_temp_c() -> int | None:
       pynvml.nvmlShutdown()
     except pynvml.NVMLError:
       pass
-# >>> END OF STEP B <<<
 
 
 # ==============================================================================
@@ -207,8 +205,7 @@ def main():
   vram_offloaded = False
   last_game_seen_time = 0.0
   session_start_time = 0.0
-  sent_2h_milestone = False
-  sent_4h_milestone = False
+  current_milestone = ""
   last_state_sync = 0.0
   set_offload_state(False, "Offloader initialized")
 
@@ -222,43 +219,47 @@ def main():
       # Start a new session clock if none is active (or previous grace period expired)
       if session_start_time == 0.0:
         session_start_time = now
-        sent_2h_milestone = False
-        sent_4h_milestone = False
+        current_milestone = ""
 
       session_mins = int((now - session_start_time) // 60)
-      milestone = ""
+      prev_milestone = current_milestone
 
       if SESSION_REMINDER_ENABLED:
-        if session_mins >= SESSION_ESCALATE_MINS and not sent_4h_milestone:
-          milestone = "4h"
-          sent_4h_milestone = True
-        elif session_mins >= SESSION_REMARK_MINS and not sent_2h_milestone:
-          milestone = "2h"
-          sent_2h_milestone = True
+        if session_mins >= SESSION_ESCALATE_MINS:
+          current_milestone = "4h"
+        elif session_mins >= SESSION_REMARK_MINS and current_milestone != "4h":
+          current_milestone = "2h"
+
+      milestone_changed = current_milestone != prev_milestone
 
       if not vram_offloaded:
         print(f"[Offloader] Heavy game detected: {trigger_source}")
         if run_lms_command(UNLOAD_CMD, "VRAM/RAM Unload"):
           vram_offloaded = True
           set_offload_state(
-              True, f"Unloaded for {trigger_source}", session_mins, milestone
+              True,
+              f"Unloaded for {trigger_source}",
+              session_mins,
+              current_milestone,
           )
           last_state_sync = now
-      elif milestone or (now - last_state_sync >= 60.0):
-        # Update session_minutes every 60s (or immediately when a milestone hits)
+      elif milestone_changed or (now - last_state_sync >= 60.0):
+        # Update session_minutes every 60s (or immediately when a milestone changes)
         set_offload_state(
-            True, f"Unloaded for {trigger_source}", session_mins, milestone
+            True,
+            f"Unloaded for {trigger_source}",
+            session_mins,
+            current_milestone,
         )
         last_state_sync = now
 
     else:
-      # Reset the session timer only after the crash/update grace period expires
+      # Reset the session timer and sticky milestone only after the grace period expires
       if session_start_time > 0.0 and (
           now - last_game_seen_time >= SESSION_GRACE_SEC
       ):
         session_start_time = 0.0
-        sent_2h_milestone = False
-        sent_4h_milestone = False
+        current_milestone = ""
 
       if vram_offloaded and (now - last_game_seen_time >= RELOAD_COOLDOWN_SEC):
         gpu_temp = get_gpu_temp_c()
@@ -274,6 +275,7 @@ def main():
               True,
               f"Cooling down ({gpu_temp}°C > {RELOAD_MAX_GPU_TEMP_C}°C target)",
               active_mins,
+              current_milestone,
           )
         else:
           temp_note = f" (GPU at {gpu_temp}°C)" if gpu_temp is not None else ""

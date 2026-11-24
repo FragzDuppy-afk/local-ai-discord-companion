@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -18,7 +19,7 @@ def get_conn() -> sqlite3.Connection:
 
 def init_db() -> None:
   """Creates telemetry and store-and-forward alert tables if they do not exist."""
-  with get_conn() as conn:
+  with closing(get_conn()) as conn, conn:
     conn.execute("""
             CREATE TABLE IF NOT EXISTS telemetry_samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,7 +51,7 @@ def log_sample(
 ) -> None:
   """Inserts one hardware telemetry snapshot into SQLite."""
   try:
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
       conn.execute(
           """
                 INSERT INTO telemetry_samples (ts, ram_percent, vram_percent, vram_used_mb, offloaded)
@@ -72,7 +73,7 @@ def get_rolling_baseline(hours: float = 24.0) -> dict:
   """Returns rolling average RAM/VRAM percentages and sample count over the lookback window."""
   cutoff = time.time() - (hours * 3600.0)
   try:
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
       row = conn.execute(
           """
                 SELECT COUNT(*), AVG(ram_percent), AVG(vram_percent)
@@ -98,7 +99,7 @@ def queue_alert(
   """Persists an outbound Discord embed to SQLite before network transmission."""
   fields_str = json.dumps(fields) if fields else None
   try:
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
       cur = conn.execute(
           """
                 INSERT INTO alert_queue (ts, title, description, color, fields_json, sent)
@@ -115,7 +116,7 @@ def queue_alert(
 def mark_alert_sent(alert_id: int) -> None:
   """Marks a queued Discord alert as delivered."""
   try:
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
       conn.execute("UPDATE alert_queue SET sent = 1 WHERE id = ?", (alert_id,))
   except sqlite3.Error:
     pass
@@ -124,7 +125,7 @@ def mark_alert_sent(alert_id: int) -> None:
 def get_pending_alerts(limit: int = 5) -> list[dict]:
   """Fetches unsent alerts so Overseer can flush them once connectivity returns."""
   try:
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
       rows = conn.execute(
           """
                 SELECT id, ts, title, description, color, fields_json
@@ -154,7 +155,7 @@ def prune_old_records() -> None:
   """Deletes old telemetry samples and delivered alerts to preserve disk headroom."""
   cutoff = time.time() - (RETENTION_DAYS * 86400.0)
   try:
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
       conn.execute("DELETE FROM telemetry_samples WHERE ts < ?", (cutoff,))
       conn.execute(
           "DELETE FROM alert_queue WHERE sent = 1 AND ts < ?", (cutoff,)

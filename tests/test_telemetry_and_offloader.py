@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,18 +10,14 @@ import telemetry_db
 class TestTelemetryDB(unittest.TestCase):
 
   def setUp(self):
-    self.tmp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-    self.tmp_db.close()
+    self.tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
     self.orig_db_path = telemetry_db.DB_PATH
-    telemetry_db.DB_PATH = self.tmp_db.name
+    telemetry_db.DB_PATH = os.path.join(self.tmp_dir.name, "test_telemetry.db")
     telemetry_db.init_db()
 
   def tearDown(self):
     telemetry_db.DB_PATH = self.orig_db_path
-    for ext in ("", "-wal", "-shm"):
-      path = self.tmp_db.name + ext
-      if os.path.exists(path):
-        os.remove(path)
+    self.tmp_dir.cleanup()
 
   def test_rolling_baseline_ignores_offloaded_samples(self):
     telemetry_db.log_sample(40.0, 20.0, 1600.0, offloaded=False)
@@ -55,7 +50,7 @@ class TestTelemetryDB(unittest.TestCase):
 class TestOffloaderRules(unittest.TestCase):
 
   def test_atomic_state_roundtrip(self):
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
       test_state = os.path.join(tmpdir, "offloader_state.json")
       with patch.object(offloader, "STATE_FILE", test_state):
         offloader.set_offload_state(True, "Unloaded for test_game.exe", 45, "")

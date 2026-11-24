@@ -11,7 +11,6 @@ import telemetry_db
 
 load_dotenv()
 
-# Try importing pynvml (nvidia-ml-py) for direct NVIDIA GPU VRAM telemetry
 try:
   import pynvml
 
@@ -24,12 +23,10 @@ except ImportError:
 # ==============================================================================
 DISCORD_WEBHOOK_URL = os.getenv("OVERSEER_WEBHOOK_URL", "")
 
-# Shared JSON state file written by offloader.py in the same directory
 OFFLOADER_STATE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "offloader_state.json"
 )
 
-# Alert & Telemetry Thresholds (configurable via .env, with safe defaults)
 VRAM_THRESHOLD_PERCENT = float(os.getenv("OVERSEER_VRAM_THRESHOLD", "85.0"))
 RAM_THRESHOLD_PERCENT = float(os.getenv("OVERSEER_RAM_THRESHOLD", "85.0"))
 SUSTAINED_SECONDS = int(os.getenv("OVERSEER_SUSTAINED_SECONDS", "10"))
@@ -72,9 +69,11 @@ def get_offloader_state() -> dict:
     return default_state
 
 
-def check_and_relieve_ram(ram_percent: float) -> tuple[str, bool]:
+def check_and_relieve_memory(
+    ram_percent: float, vram_percent: float
+) -> tuple[str, bool]:
   """
-  Checks offloader status during a spike.
+  Checks offloader status during a RAM or VRAM spike.
   Returns (status_message, is_critical_action_taken).
   """
   state = get_offloader_state()
@@ -82,7 +81,13 @@ def check_and_relieve_ram(ram_percent: float) -> tuple[str, bool]:
   if state["vram_offloaded"]:
     return f"🛡️ Offloader Active ({state['reason']})", False
 
-  if ram_percent >= RAM_THRESHOLD_PERCENT:
+  ram_critical = ram_percent >= RAM_THRESHOLD_PERCENT
+  vram_critical = vram_percent >= VRAM_THRESHOLD_PERCENT
+
+  if ram_critical or vram_critical:
+    target = "System RAM & GPU VRAM" if (ram_critical and vram_critical) else (
+        "GPU VRAM" if vram_critical else "System RAM"
+    )
     try:
       subprocess.run(
           ["lms", "unload", "--all"],
@@ -92,7 +97,12 @@ def check_and_relieve_ram(ram_percent: float) -> tuple[str, bool]:
           stderr=subprocess.PIPE,
       )
       return (
-          "🚨 Emergency Action: Executed `lms unload --all` to free System RAM",
+          f"🚨 Emergency Action: Executed `lms unload --all` to free {target}",
+          True,
+      )
+    except FileNotFoundError:
+      return (
+          "⚠️ Emergency Unload Failed: `lms` CLI not found in PATH (run `lms bootstrap`)",
           True,
       )
     except Exception as e:
@@ -171,7 +181,7 @@ def get_top_vram_processes(handle, limit: int = 3) -> str:
   except pynvml.NVMLError:
     return "• Could not query GPU processes"
 
-# >>> PASTE PART 2 DIRECTLY BELOW THIS LINE <<<
+
 # ==============================================================================
 # 4. DISCORD WEBHOOK RELAY (WITH SQLITE STORE-AND-FORWARD QUEUE)
 # ==============================================================================
@@ -387,7 +397,7 @@ def main():
         elif (now - ram_spike_start >= SUSTAINED_SECONDS) and (
             now - last_ram_alert >= ALERT_COOLDOWN_SEC
         ):
-          offloader_note, is_critical = check_and_relieve_ram(ram_percent)
+          offloader_note, is_critical = check_and_relieve_memory(ram_percent, vram_percent)
           top_ram = get_top_ram_processes(3)
           baseline = telemetry_db.get_rolling_baseline(24.0)
           delta_str = (
@@ -449,7 +459,7 @@ def main():
         elif (now - vram_spike_start >= SUSTAINED_SECONDS) and (
             now - last_vram_alert >= ALERT_COOLDOWN_SEC
         ):
-          offloader_note, is_critical = check_and_relieve_ram(ram_percent)
+          offloader_note, is_critical = check_and_relieve_memory(ram_percent, vram_percent)
           top_vram = get_top_vram_processes(gpu_handle, 3)
           baseline = telemetry_db.get_rolling_baseline(24.0)
           delta_str = (
@@ -596,6 +606,7 @@ def main():
         # Reset drift timers cleanly whenever a game is running
         ram_drift_start = 0.0
         vram_drift_start = 0.0
+
       time.sleep(POLL_INTERVAL_SEC)
 
   finally:
