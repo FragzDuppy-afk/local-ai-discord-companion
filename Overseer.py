@@ -1,3 +1,4 @@
+import contextlib
 from datetime import datetime
 import json
 import os
@@ -24,9 +25,10 @@ except ImportError:
 # ==============================================================================
 DISCORD_WEBHOOK_URL = os.getenv("OVERSEER_WEBHOOK_URL", "")
 
-OFFLOADER_STATE_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "offloader_state.json"
-)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OFFLOADER_STATE_FILE = os.path.join(BASE_DIR, "offloader_state.json")
+LMS_LOCK_FILE = os.path.join(BASE_DIR, "lms_cli.lock")
+LMS_TIMEOUT_SEC = float(os.getenv("OVERSEER_LMS_TIMEOUT_SEC", "20.0"))
 
 VRAM_THRESHOLD_PERCENT = float(os.getenv("OVERSEER_VRAM_THRESHOLD", "85.0"))
 RAM_THRESHOLD_PERCENT = float(os.getenv("OVERSEER_RAM_THRESHOLD", "85.0"))
@@ -36,6 +38,7 @@ ALERT_COOLDOWN_SEC = int(os.getenv("OVERSEER_ALERT_COOLDOWN", "300"))
 SAMPLE_LOG_INTERVAL_SEC = float(os.getenv("OVERSEER_SAMPLE_INTERVAL", "10.0"))
 DRIFT_DELTA_PERCENT = float(os.getenv("OVERSEER_DRIFT_DELTA", "25.0"))
 MIN_BASELINE_SAMPLES = int(os.getenv("OVERSEER_MIN_BASELINE_SAMPLES", "60"))
+OFFLOADER_STALE_SEC = float(os.getenv("OVERSEER_OFFLOADER_STALE_SEC", "15.0"))
 
 
 # Embed Colors matched to Overseer's purple avatar & alert severity
@@ -54,6 +57,8 @@ def get_offloader_state() -> dict:
       "vram_offloaded": False,
       "reason": "Offloader inactive or state file missing",
       "timestamp": 0.0,
+      "heartbeat_ts": 0.0,
+      "offloader_pid": None,
   }
   if not os.path.exists(OFFLOADER_STATE_FILE):
     return default_state
@@ -61,26 +66,90 @@ def get_offloader_state() -> dict:
   try:
     with open(OFFLOADER_STATE_FILE, "r", encoding="utf-8") as f:
       data = json.load(f)
+      ts = float(data.get("timestamp", 0.0))
+      hb = float(data.get("heartbeat_ts", ts))
+      pid_raw = data.get("offloader_pid")
+      pid = int(pid_raw) if pid_raw is not None else None
       return {
           "vram_offloaded": bool(data.get("vram_offloaded", False)),
           "reason": str(data.get("reason", "")),
-          "timestamp": float(data.get("timestamp", 0.0)),
+          "timestamp": ts,
+          "heartbeat_ts": hb,
+          "offloader_pid": pid,
       }
   except (OSError, json.JSONDecodeError, ValueError):
     return default_state
+
+
+def is_offloader_live(state: dict, now: float | None = None) -> bool:
+  """Returns True if offloader.py has a recent heartbeat and (if known) an active PID."""
+  current_ts = time.time() if now is None else now
+  last_beat = max(
+      float(state.get("heartbeat_ts", 0.0)),
+      float(state.get("timestamp", 0.0)),
+  )
+  if last_beat <= 0.0 or (current_ts - last_beat) > OFFLOADER_STALE_SEC:
+    return False
+
+  pid = state.get("offloader_pid")
+  if pid is not None:
+    try:
+      if not psutil.pid_exists(pid):
+        return False
+      proc = psutil.Process(pid)
+      if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+        return False
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+      return False
+
+  return True
+
+
+@contextlib.contextmanager
+def _lms_cli_lock(wait_sec: float = 5.0):
+  """Best-effort cross-process lock around `lms` CLI calls without ever deadlocking."""
+  deadline = time.time() + wait_sec
+  acquired = False
+  while time.time() < deadline:
+    try:
+      fd = os.open(LMS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+      os.close(fd)
+      acquired = True
+      break
+    except FileExistsError:
+      try:
+        if time.time() - os.path.getmtime(LMS_LOCK_FILE) > 60.0:
+          os.remove(LMS_LOCK_FILE)
+          continue
+      except OSError:
+        pass
+      time.sleep(0.1)
+    except OSError:
+      break
+  try:
+    yield
+  finally:
+    if acquired:
+      try:
+        os.remove(LMS_LOCK_FILE)
+      except OSError:
+        pass
 
 
 def check_and_relieve_memory(
     ram_percent: float, vram_percent: float
 ) -> tuple[str, bool]:
   """
-  Checks offloader status during a RAM or VRAM spike.
+  Tier 2 memory guard: defers to offloader.py when live, or runs an emergency
+  unload only if offloader.py is stale/offline during a sustained spike.
   Returns (status_message, is_critical_action_taken).
   """
   state = get_offloader_state()
+  offloader_live = is_offloader_live(state)
 
   if state["vram_offloaded"]:
-    return f"🛡️ Offloader Active ({state['reason']})", False
+    owner_tag = "Offloader Live" if offloader_live else "Offloader State Active"
+    return f"🛡️ {owner_tag} ({state['reason']})", False
 
   ram_critical = ram_percent >= RAM_THRESHOLD_PERCENT
   vram_critical = vram_percent >= VRAM_THRESHOLD_PERCENT
@@ -89,27 +158,44 @@ def check_and_relieve_memory(
     target = "System RAM & GPU VRAM" if (ram_critical and vram_critical) else (
         "GPU VRAM" if vram_critical else "System RAM"
     )
-    try:
-      subprocess.run(
-          ["lms", "unload", "--all"],
-          check=True,
-          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-          stdout=subprocess.PIPE,
-          stderr=subprocess.PIPE,
-      )
+    if offloader_live:
       return (
-          f"🚨 Emergency Action: Executed `lms unload --all` to free {target}",
+          f"🛡️ Deferred to Offloader (PID {state['offloader_pid']}) for {target}",
+          False,
+      )
+
+    try:
+      with _lms_cli_lock():
+        subprocess.run(
+            ["lms", "unload", "--all"],
+            check=True,
+            timeout=LMS_TIMEOUT_SEC,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+      return (
+          f"🚨 Fallback Action (Offloader Offline): Executed `lms unload --all` to free {target}",
           True,
       )
     except FileNotFoundError:
       return (
-          "⚠️ Emergency Unload Failed: `lms` CLI not found in PATH (run `lms bootstrap`)",
+          "⚠️ Fallback Unload Failed: `lms` CLI not found in PATH (run `lms bootstrap`)",
+          True,
+      )
+    except subprocess.TimeoutExpired:
+      return (
+          f"⚠️ Fallback Unload Timed Out after {LMS_TIMEOUT_SEC:.0f}s",
           True,
       )
     except Exception as e:
-      return f"⚠️ Emergency Unload Failed: {e}", True
+      return f"⚠️ Fallback Unload Failed: {e}", True
 
-  return "🟢 Offloader Idle (LLM loaded)", False
+  return (
+      "🟢 Offloader Live (LLM loaded)"
+      if offloader_live
+      else "🟡 Offloader Offline / Stale (LLM loaded)"
+  ), False
 
 
 # ==============================================================================
@@ -411,7 +497,6 @@ def main():
   last_ram_drift_alert = 0.0
   last_vram_drift_alert = 0.0
 
-
   try:
     while True:
       now = time.time()
@@ -442,7 +527,9 @@ def main():
         elif (now - ram_spike_start >= SUSTAINED_SECONDS) and (
             now - last_ram_alert >= ALERT_COOLDOWN_SEC
         ):
-          offloader_note, is_critical = check_and_relieve_memory(ram_percent, vram_percent)
+          offloader_note, is_critical = check_and_relieve_memory(
+              ram_percent, vram_percent
+          )
           top_ram = get_top_ram_processes(3)
           baseline = telemetry_db.get_rolling_baseline(24.0)
           delta_str = (
@@ -504,7 +591,9 @@ def main():
         elif (now - vram_spike_start >= SUSTAINED_SECONDS) and (
             now - last_vram_alert >= ALERT_COOLDOWN_SEC
         ):
-          offloader_note, is_critical = check_and_relieve_memory(ram_percent, vram_percent)
+          offloader_note, is_critical = check_and_relieve_memory(
+              ram_percent, vram_percent
+          )
           top_vram = get_top_vram_processes(gpu_handle, 3)
           baseline = telemetry_db.get_rolling_baseline(24.0)
           delta_str = (

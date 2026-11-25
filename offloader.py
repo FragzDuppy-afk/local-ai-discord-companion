@@ -1,9 +1,11 @@
+import contextlib
 import json
 import os
 import subprocess
 import time
 from dotenv import load_dotenv
 import psutil
+
 try:
   import pynvml
 
@@ -19,6 +21,8 @@ load_dotenv()
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "offloader_state.json")
+LMS_LOCK_FILE = os.path.join(BASE_DIR, "lms_cli.lock")
+LMS_TIMEOUT_SEC = float(os.getenv("OFFLOADER_LMS_TIMEOUT_SEC", "20.0"))
 
 GAMES_CONFIG_PATH = os.path.join(BASE_DIR, "games_config.json")
 GAMES_EXAMPLE_PATH = os.path.join(BASE_DIR, "games_config.example.json")
@@ -69,6 +73,9 @@ WHITELISTED_EXES = {
 HEAVY_STANDALONE_EXES = {
     e.lower() for e in _games_cfg.get("heavy_standalone_exes", ["javaw.exe"])
 }
+WATCHED_PROCESS_NAMES = {
+    e.lower() for e in _games_cfg.get("watched_process_names", [])
+}
 
 # LM Studio CLI commands (reads LLM_MODEL and AUTO_RELOAD_ENABLED from .env)
 LLM_MODEL = os.getenv("LLM_MODEL", "google/gemma-4-e2b")
@@ -81,6 +88,8 @@ RELOAD_CMD = ["lms", "load", LLM_MODEL, "--gpu", "max"]
 
 POLL_INTERVAL_SEC = float(os.getenv("OFFLOADER_POLL_INTERVAL", "1.0"))
 RELOAD_COOLDOWN_SEC = float(os.getenv("OFFLOADER_RELOAD_COOLDOWN", "20.0"))
+VRAM_SETTLE_MAX_WAIT_SEC = float(os.getenv("OFFLOADER_VRAM_SETTLE_SEC", "8.0"))
+VRAM_SETTLE_TARGET_PCT = float(os.getenv("OFFLOADER_VRAM_TARGET_PCT", "40.0"))
 
 RELOAD_MAX_GPU_TEMP_C = int(os.getenv("RELOAD_MAX_GPU_TEMP_C", "60"))
 
@@ -102,14 +111,17 @@ def set_offload_state(
     session_minutes: int = 0,
     session_milestone: str = "",
 ) -> None:
-  """Atomically writes offload & session status for AI_Bot.py and overseer.py."""
+  """Atomically writes offload, liveness, and session status for AI_Bot.py and Overseer.py."""
   tmp_file = f"{STATE_FILE}.tmp"
+  now = time.time()
   payload = {
       "vram_offloaded": offloaded,
       "reason": reason,
       "session_minutes": session_minutes,
       "session_milestone": session_milestone,
-      "timestamp": time.time(),
+      "offloader_pid": os.getpid(),
+      "heartbeat_ts": now,
+      "timestamp": now,
   }
   try:
     with open(tmp_file, "w", encoding="utf-8") as f:
@@ -128,28 +140,24 @@ def normalize_path(path_str: str) -> str:
 
 def is_heavy_game_running() -> tuple[bool, str]:
   """
-    Scans active processes to detect non-whitelisted games.
-    Returns (True, trigger_label) if an offload is needed, else (False, "").
-    """
+  Scans active processes to detect non-whitelisted games.
+  Returns (True, trigger_label) if an offload is needed, else (False, "").
+  """
   norm_roots = [normalize_path(p) for p in WATCHED_GAME_DIRS]
 
   for proc in psutil.process_iter(["name", "exe"]):
     try:
       proc_name = (proc.info["name"] or "").lower()
-      proc_exe = normalize_path(proc.info["exe"])
-
-      if not proc_name or not proc_exe:
+      if not proc_name or proc_name in WHITELISTED_EXES:
         continue
 
-      # Rule 1: Skip explicitly whitelisted executables
-      if proc_name in WHITELISTED_EXES:
-        continue
-
-      # Rule 2: Catch standalone heavy engines like Modded Java Minecraft
-      if proc_name in HEAVY_STANDALONE_EXES:
+      if proc_name in HEAVY_STANDALONE_EXES or proc_name in WATCHED_PROCESS_NAMES:
         return True, proc_name
 
-      # Rule 3: Check if executable runs from a watched game root directory
+      proc_exe = normalize_path(proc.info["exe"])
+      if not proc_exe:
+        continue
+
       for root in norm_roots:
         if proc_exe.startswith(root + os.sep):
           relative_path = os.path.relpath(proc_exe, root)
@@ -164,42 +172,122 @@ def is_heavy_game_running() -> tuple[bool, str]:
   return False, ""
 
 
-def run_lms_command(cmd: list[str], action_label: str) -> bool:
-  """Runs an LM Studio CLI command silently and returns True if successful."""
+@contextlib.contextmanager
+def _lms_cli_lock(wait_sec: float = 5.0):
+  """Best-effort cross-process lock around `lms` CLI calls without ever deadlocking."""
+  deadline = time.time() + wait_sec
+  acquired = False
+  while time.time() < deadline:
+    try:
+      fd = os.open(LMS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+      os.close(fd)
+      acquired = True
+      break
+    except FileExistsError:
+      try:
+        if time.time() - os.path.getmtime(LMS_LOCK_FILE) > 60.0:
+          os.remove(LMS_LOCK_FILE)
+          continue
+      except OSError:
+        pass
+      time.sleep(0.1)
+    except OSError:
+      break
   try:
-    print(f"[Offloader] Executing {action_label}: {' '.join(cmd)}")
-    subprocess.run(
-        cmd,
-        check=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    yield
+  finally:
+    if acquired:
+      try:
+        os.remove(LMS_LOCK_FILE)
+      except OSError:
+        pass
+
+
+def run_lms_command(cmd: list[str], action_label: str) -> bool:
+  """Runs an LM Studio CLI command with a timeout and lock; returns True if successful."""
+  try:
+    with _lms_cli_lock():
+      print(f"[Offloader] Executing {action_label}: {' '.join(cmd)}")
+      subprocess.run(
+          cmd,
+          check=True,
+          timeout=LMS_TIMEOUT_SEC,
+          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE,
+      )
     return True
   except FileNotFoundError:
     print("[Offloader] Error: 'lms' CLI not found in PATH.")
+    return False
+  except subprocess.TimeoutExpired:
+    print(f"[Offloader] Command timed out ({action_label} after {LMS_TIMEOUT_SEC}s).")
     return False
   except subprocess.CalledProcessError as e:
     print(f"[Offloader] Command failed ({action_label}): {e}")
     return False
 
 
-def get_gpu_temp_c() -> int | None:
-  """Returns current NVIDIA GPU core temp in Celsius, or None if unavailable."""
+def _open_nvml_handle():
   if not NVML_AVAILABLE:
     return None
   try:
     pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    return pynvml.nvmlDeviceGetHandleByIndex(0)
+  except pynvml.NVMLError:
+    return None
+
+
+def _close_nvml_handle() -> None:
+  if not NVML_AVAILABLE:
+    return
+  try:
+    pynvml.nvmlShutdown()
+  except pynvml.NVMLError:
+    pass
+
+
+def wait_for_vram_release(
+    max_wait_sec: float = VRAM_SETTLE_MAX_WAIT_SEC,
+    poll_sec: float = 0.25,
+    target_pct: float = VRAM_SETTLE_TARGET_PCT,
+) -> float | None:
+  """Polls VRAM after unload so downstream scripts don't race GPU driver cleanup."""
+  handle = _open_nvml_handle()
+  if handle is None:
+    time.sleep(1.0)
+    return None
+
+  latest_pct = None
+  deadline = time.time() + max_wait_sec
+  try:
+    while time.time() < deadline:
+      mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+      if mem.total > 0:
+        latest_pct = round((mem.used / mem.total) * 100.0, 1)
+        if latest_pct <= target_pct:
+          return latest_pct
+      time.sleep(poll_sec)
+  except pynvml.NVMLError:
+    return latest_pct
+  finally:
+    _close_nvml_handle()
+
+  return latest_pct
+
+
+def get_gpu_temp_c() -> int | None:
+  """Returns current NVIDIA GPU core temp in Celsius, or None if unavailable."""
+  handle = _open_nvml_handle()
+  if handle is None:
+    return None
+  try:
     temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
     return int(temp)
   except pynvml.NVMLError:
     return None
   finally:
-    try:
-      pynvml.nvmlShutdown()
-    except pynvml.NVMLError:
-      pass
+    _close_nvml_handle()
 
 
 # ==============================================================================
@@ -221,7 +309,6 @@ def main():
     if heavy_active:
       last_game_seen_time = now
 
-      # Start a new session clock if none is active (or previous grace period expired)
       if session_start_time == 0.0:
         session_start_time = now
         current_milestone = ""
@@ -240,6 +327,11 @@ def main():
       if not vram_offloaded:
         print(f"[Offloader] Heavy game detected: {trigger_source}")
         if run_lms_command(UNLOAD_CMD, "VRAM/RAM Unload"):
+          settled_pct = wait_for_vram_release()
+          settle_note = (
+              f" (VRAM at {settled_pct}%)" if settled_pct is not None else ""
+          )
+          print(f"[Offloader] Unload handoff complete{settle_note}.")
           vram_offloaded = True
           set_offload_state(
               True,
@@ -247,9 +339,8 @@ def main():
               session_mins,
               current_milestone,
           )
-          last_state_sync = now
-      elif milestone_changed or (now - last_state_sync >= 60.0):
-        # Update session_minutes every 60s (or immediately when a milestone changes)
+          last_state_sync = time.time()
+      elif milestone_changed or (now - last_state_sync >= 10.0):
         set_offload_state(
             True,
             f"Unloaded for {trigger_source}",
@@ -259,7 +350,6 @@ def main():
         last_state_sync = now
 
     else:
-      # Reset the session timer and sticky milestone only after the grace period expires
       if session_start_time > 0.0 and (
           now - last_game_seen_time >= SESSION_GRACE_SEC
       ):
@@ -274,7 +364,6 @@ def main():
             else 0
         )
 
-        # Hold reload if GPU is still heat-soaked above RELOAD_MAX_GPU_TEMP_C
         if gpu_temp is not None and gpu_temp > RELOAD_MAX_GPU_TEMP_C:
           set_offload_state(
               True,
@@ -282,6 +371,7 @@ def main():
               active_mins,
               current_milestone,
           )
+          last_state_sync = now
         else:
           temp_note = f" (GPU at {gpu_temp}°C)" if gpu_temp is not None else ""
           print(
@@ -292,6 +382,20 @@ def main():
             run_lms_command(RELOAD_CMD, "VRAM/RAM Reload")
           vram_offloaded = False
           set_offload_state(False, "Game exited; VRAM/RAM clear", 0, "")
+          last_state_sync = now
+      elif now - last_state_sync >= 10.0:
+        # Refresh heartbeat periodically while idle or cooling down
+        set_offload_state(
+            vram_offloaded,
+            "Game exited; VRAM/RAM clear"
+            if not vram_offloaded
+            else f"Cooling down ({get_gpu_temp_c()}°C > {RELOAD_MAX_GPU_TEMP_C}°C target)",
+            int((now - session_start_time) // 60)
+            if vram_offloaded and session_start_time > 0.0
+            else 0,
+            current_milestone if vram_offloaded else "",
+        )
+        last_state_sync = now
 
     time.sleep(POLL_INTERVAL_SEC)
 

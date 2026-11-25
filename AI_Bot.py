@@ -1,10 +1,12 @@
 import asyncio
+import contextlib
 import ctypes
 from datetime import datetime
 import json
 import os
 import random
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -14,7 +16,6 @@ from ddgs import DDGS
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
-import socket
 from openai import OpenAI
 import psutil
 import telemetry_db
@@ -22,6 +23,7 @@ import telemetry_db
 # Gracefully handle systems without NVIDIA drivers/libraries (matches Overseer.py)
 try:
   import pynvml
+
   NVML_AVAILABLE = True
 except ImportError:
   NVML_AVAILABLE = False
@@ -58,6 +60,28 @@ CYCLE_END_HOUR = int(os.getenv("CYCLE_END_HOUR", "22"))
 DEFAULT_LOCATION = os.getenv("DEFAULT_LOCATION", "Chicago, IL")
 TIMEZONE_LABEL = os.getenv("TIMEZONE_LABEL", "local time")
 
+# ==============================================================================
+# OPTIONAL FREE CLOUD FALLBACK (STRICTLY OPT-IN VIA GEMINI_API_KEY)
+# ==============================================================================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_BASE_URL = os.getenv(
+    "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
+).strip()
+GEMINI_FALLBACK_MODEL = os.getenv(
+    "GEMINI_FALLBACK_MODEL", "gemma-4-26b-a4b-it"
+).strip()
+GEMINI_REASONING_EFFORT = os.getenv(
+    "GEMINI_REASONING_EFFORT", "minimal"
+).strip()
+
+# Only instantiate the cloud OpenAI-compatible client when an API key is provided.
+# Leaving GEMINI_API_KEY blank keeps the bot 100% local with zero cloud calls.
+gemini_llm = (
+    OpenAI(base_url=GEMINI_BASE_URL, api_key=GEMINI_API_KEY)
+    if GEMINI_API_KEY
+    else None
+)
+
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://127.0.0.1:1234/v1")
 LM_STUDIO_PORT = os.getenv("LM_STUDIO_PORT", "1234")
 LLM_MODEL = os.getenv("LLM_MODEL", "google/gemma-4-e2b")
@@ -73,6 +97,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RELAXED_VRAM_PERCENT = 80.0
 PAUSE_VRAM_PERCENT = 90.0
 RESUME_VRAM_PERCENT = 70.0
+OFFLOADER_STALE_SEC = float(os.getenv("OFFLOADER_STALE_SEC", "15.0"))
 SOUNDS_FOLDER = os.path.join(BASE_DIR, "Sounds")
 SESSION_ALERTS_ENABLED = (
     os.getenv("SESSION_ALERTS_ENABLED", "true").strip().lower() == "true"
@@ -127,7 +152,6 @@ SYSTEM_PROMPT = (
 )
 
 
-
 WEATHER_KEYWORDS = {"weather", "temp", "temperature", "forecast", "outside"}
 
 # Expanded to catch natural shopping, stock, location, and availability questions
@@ -178,7 +202,9 @@ _SEARCH_FILLER_RE = re.compile(
 def sanitize_search_query(raw_text: str) -> str:
   """Strips conversational filler so DDGS receives high-signal keywords."""
   # Normalize "5060ti" -> "5060 ti" and remove punctuation noise
-  cleaned = re.sub(r"(\d{4})(ti|super|xt|xtx)\b", r"\1 \2", raw_text, flags=re.IGNORECASE)
+  cleaned = re.sub(
+      r"(\d{4})(ti|super|xt|xtx)\b", r"\1 \2", raw_text, flags=re.IGNORECASE
+  )
   cleaned = re.sub(r"[^\w\s\-]", " ", cleaned)
   cleaned = _SEARCH_FILLER_RE.sub(" ", cleaned)
   cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -228,67 +254,112 @@ OFFLOADER_STATE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "offloader_state.json"
 )
 
-def get_gaming_offload_notice() -> str | None:
-    """
-    Checks offloader_state.json before querying LM Studio.
-    Returns a clean status reply if VRAM is offloaded, or None if the LLM is ready.
-    """
-    if not os.path.exists(OFFLOADER_STATE_FILE):
-        return None
 
+def _read_offloader_state() -> dict:
+  """Reads offloader_state.json safely."""
+  default_state = {
+      "vram_offloaded": False,
+      "reason": "",
+      "session_minutes": 0,
+      "session_milestone": "",
+      "timestamp": 0.0,
+      "heartbeat_ts": 0.0,
+      "offloader_pid": None,
+  }
+  if not os.path.exists(OFFLOADER_STATE_FILE):
+    return default_state
+  try:
+    with open(OFFLOADER_STATE_FILE, "r", encoding="utf-8") as f:
+      data = json.load(f)
+      ts = float(data.get("timestamp", 0.0))
+      hb = float(data.get("heartbeat_ts", ts))
+      pid_raw = data.get("offloader_pid")
+      pid = int(pid_raw) if pid_raw is not None else None
+      return {
+          "vram_offloaded": bool(data.get("vram_offloaded", False)),
+          "reason": str(data.get("reason", "")),
+          "session_minutes": int(data.get("session_minutes", 0)),
+          "session_milestone": str(data.get("session_milestone", "")),
+          "timestamp": ts,
+          "heartbeat_ts": hb,
+          "offloader_pid": pid,
+      }
+  except (OSError, json.JSONDecodeError, ValueError):
+    return default_state
+
+
+def is_offloader_live(state: dict | None = None, now: float | None = None) -> bool:
+  """Returns True if offloader.py has a fresh heartbeat and active PID."""
+  data = state if state is not None else _read_offloader_state()
+  current_ts = time.time() if now is None else now
+  last_beat = max(
+      float(data.get("heartbeat_ts", 0.0)),
+      float(data.get("timestamp", 0.0)),
+  )
+  if last_beat <= 0.0 or (current_ts - last_beat) > OFFLOADER_STALE_SEC:
+    return False
+
+  pid = data.get("offloader_pid")
+  if pid is not None:
     try:
-        with open(OFFLOADER_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if data.get("vram_offloaded", False):
-                reason = data.get("reason", "a heavy application is active")
-                return (
-                    f"⚡ **Gaming / Relaxed Mode Active:** Local neural processing is temporarily "
-                    f"offloaded ({reason}) to preserve system stability and VRAM. "
-                    f"Full capabilities will resume automatically once the session concludes."
-                )
-    except (OSError, json.JSONDecodeError):
-        pass
+      if not psutil.pid_exists(pid):
+        return False
+      proc = psutil.Process(pid)
+      if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+        return False
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+      return False
 
-    return None
+  return True
+
+
+def get_gaming_offload_notice() -> str | None:
+  """
+  Checks offloader_state.json before querying LM Studio.
+  Returns a clean status reply if VRAM is offloaded, or None if the LLM is ready.
+  """
+  data = _read_offloader_state()
+  if data.get("vram_offloaded", False):
+    reason = data.get("reason") or "a heavy application is active"
+    return (
+        "⚡ **Gaming / Relaxed Mode Active:** Local neural processing is"
+        f" temporarily offloaded ({reason}) to preserve system stability and"
+        " VRAM. Full capabilities will resume automatically once the session"
+        " concludes."
+    )
+  return None
 
 
 def check_session_milestone() -> str | None:
   """Reads offloader_state.json for single-fire 2h/4h gaming session milestones."""
   global last_handled_milestone
-  if not SESSION_ALERTS_ENABLED or not os.path.exists(OFFLOADER_STATE_FILE):
+  if not SESSION_ALERTS_ENABLED:
     return None
 
-  try:
-    with open(OFFLOADER_STATE_FILE, "r", encoding="utf-8") as f:
-      data = json.load(f)
+  data = _read_offloader_state()
+  if not data.get("vram_offloaded", False):
+    last_handled_milestone = ""
+    return None
 
-    if not data.get("vram_offloaded", False):
-      last_handled_milestone = ""
-      return None
+  milestone = str(data.get("session_milestone", ""))
+  session_mins = int(data.get("session_minutes", 0))
+  reason = str(data.get("reason", "Active session")).replace("Unloaded for ", "")
 
-    milestone = str(data.get("session_milestone", ""))
-    session_mins = int(data.get("session_minutes", 0))
-    reason = str(data.get("reason", "Active session")).replace(
-        "Unloaded for ", ""
-    )
-
-    if milestone and milestone != last_handled_milestone:
-      last_handled_milestone = milestone
-      hours = round(session_mins / 60, 1)
-      if milestone == "4h":
-        return (
-            f"⏳ **Extended Session Check-In ({hours}h), {USER_TITLE}:** "
-            f"Active workload detected ({reason}). Consider stepping away for water, "
-            f"stretching, and resting your eyes before continuing."
-        )
-      if milestone == "2h":
-        return (
-            f"🕒 **Session Milestone ({hours}h), {USER_TITLE}:** "
-            f"You've been running continuously ({reason}). Good checkpoint to grab water or stretch."
-        )
-  except (OSError, json.JSONDecodeError, ValueError):
-    pass
-
+  if milestone and milestone != last_handled_milestone:
+    last_handled_milestone = milestone
+    hours = round(session_mins / 60, 1)
+    if milestone == "4h":
+      return (
+          f"⏳ **Extended Session Check-In ({hours}h), {USER_TITLE}:** "
+          f"Active workload detected ({reason}). Consider stepping away for"
+          " water, stretching, and resting your eyes before continuing."
+      )
+    if milestone == "2h":
+      return (
+          f"🕒 **Session Milestone ({hours}h), {USER_TITLE}:** "
+          f"You've been running continuously ({reason}). Good checkpoint to grab"
+          " water or stretch."
+      )
   return None
 
 
@@ -324,11 +395,18 @@ def get_gpu_vram_stats() -> dict:
     pynvml.nvmlInit()
     handle = pynvml.nvmlDeviceGetHandleByIndex(0)
     mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    temp_c = int(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
+    temp_c = int(
+        pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+    )
     used_gb = round(mem.used / (1024**3), 2)
     total_gb = round(mem.total / (1024**3), 2)
     percent = round((mem.used / mem.total) * 100.0, 1)
-    return {"used_gb": used_gb, "total_gb": total_gb, "percent": percent, "temp_c": temp_c}
+    return {
+        "used_gb": used_gb,
+        "total_gb": total_gb,
+        "percent": percent,
+        "temp_c": temp_c,
+    }
   except Exception:
     return {"used_gb": 0.0, "total_gb": 0.0, "percent": 0.0, "temp_c": None}
   finally:
@@ -338,20 +416,58 @@ def get_gpu_vram_stats() -> dict:
       pass
 
 
-def unload_vram():
-  """Unloads active LM Studio models to immediately free GPU VRAM."""
+LMS_LOCK_FILE = os.path.join(BASE_DIR, "lms_cli.lock")
+LMS_TIMEOUT_SEC = float(os.getenv("AI_BOT_LMS_TIMEOUT_SEC", "20.0"))
+
+
+@contextlib.contextmanager
+def _lms_cli_lock(wait_sec: float = 5.0):
+  """Best-effort cross-process lock around `lms` CLI calls without ever deadlocking."""
+  deadline = time.time() + wait_sec
+  acquired = False
+  while time.time() < deadline:
+    try:
+      fd = os.open(LMS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+      os.close(fd)
+      acquired = True
+      break
+    except FileExistsError:
+      try:
+        if time.time() - os.path.getmtime(LMS_LOCK_FILE) > 60.0:
+          os.remove(LMS_LOCK_FILE)
+          continue
+      except OSError:
+        pass
+      time.sleep(0.1)
+    except OSError:
+      break
   try:
-    subprocess.run(
-        ["lms", "unload", "--all"],
-        creationflags=NO_WINDOW_FLAG,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    yield
+  finally:
+    if acquired:
+      try:
+        os.remove(LMS_LOCK_FILE)
+      except OSError:
+        pass
+
+
+def _run_lms_guarded(cmd: list[str]) -> None:
+  try:
+    with _lms_cli_lock():
+      subprocess.run(
+          cmd,
+          timeout=LMS_TIMEOUT_SEC,
+          creationflags=NO_WINDOW_FLAG,
+          stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL,
+      )
   except Exception:
     pass
 
 
-
+def unload_vram():
+  """Fallback-only unload helper when offloader.py is not live."""
+  _run_lms_guarded(["lms", "unload", "--all"])
 
 def get_system_status():
   """Builds the formatted hardware manifest for the !status Discord command."""
@@ -361,6 +477,7 @@ def get_system_status():
   disk = psutil.disk_usage(os.path.abspath(os.sep))
   vram = get_gpu_vram_stats()
   baseline = telemetry_db.get_rolling_baseline(24.0)
+  offloader_live = is_offloader_live()
 
   ram_used_gb = round(ram.used / (1024**3), 1)
   ram_total_gb = round(ram.total / (1024**3), 1)
@@ -380,7 +497,7 @@ def get_system_status():
   )
 
   if vram["percent"] >= PAUSE_VRAM_PERCENT:
-    vram_remark = f"CRITICAL (>=90%){vram_avg_str} — Model unloaded"
+    vram_remark = f"CRITICAL (>=90%){vram_avg_str} — Model paused/unloaded"
   elif vram["percent"] >= RELAXED_VRAM_PERCENT:
     vram_remark = f"RELAXED MODE (>=80%){vram_avg_str} — Context trimmed"
   else:
@@ -402,6 +519,8 @@ def get_system_status():
   else:
     ai_state = "ONLINE"
 
+  offloader_tag = "Offloader: LIVE" if offloader_live else "Offloader: OFFLINE"
+
   return (
       "```\n"
       f"=== {BOT_NAME.upper()} HARDWARE & EQUIPMENT MANIFEST ===\n"
@@ -410,10 +529,11 @@ def get_system_status():
       f"GPU VRAM     : {vram['used_gb']}/{vram['total_gb']} GB ({vram['percent']}%) | {vram_remark}\n"
       f"PRIMARY SSD  : {disk_free_gb:>5} GB Free | {disk_remark}\n"
       f"24H BASELINE : {baseline_line}\n"
-      f"AI BACKEND   : {LLM_MODEL} (Port {LM_STUDIO_PORT}/v1) | {ai_state}\n"
+      f"AI BACKEND   : {LLM_MODEL} (Port {LM_STUDIO_PORT}/v1) | {ai_state} | {offloader_tag}\n"
       "============================================\n"
       "```"
   )
+
 
 def get_help_manifest() -> str:
   """Builds a dynamic command reference including preset-specific audio commands."""
@@ -433,7 +553,6 @@ def get_help_manifest() -> str:
   )
 
 
-
 # ==============================================================================
 # WEATHER, WEB SEARCH & LLM GENERATION
 # ==============================================================================
@@ -449,11 +568,14 @@ def fetch_exact_weather():
         f"{DEFAULT_LOCATION} current temperature weather today"
     )
 
+
 def _run_ddgs_backends(search_query: str, max_results: int = 4) -> list[str]:
   """Helper that queries DDGS across fallback backends and formats clean snippets."""
   for b in ["brave,bing,yahoo", "auto", "wikipedia"]:
     try:
-      results = list(DDGS().text(search_query, max_results=max_results, backend=b))
+      results = list(
+          DDGS().text(search_query, max_results=max_results, backend=b)
+      )
       if not results:
         continue
 
@@ -488,7 +610,9 @@ def fetch_web_search(query: str) -> str:
   # Pass 2: Two-step fallback for "<retailer> near <zip>" when live stock returns empty
   store_query = extract_store_location_query(query)
   if store_query and store_query != clean_query.lower():
-    print(f"[SEARCH] Primary returned empty -> running store fallback: '{store_query}'")
+    print(
+        f"[SEARCH] Primary returned empty -> running store fallback: '{store_query}'"
+    )
     store_snippets = _run_ddgs_backends(store_query, max_results=4)
     if store_snippets:
       joined_stores = "\n".join(store_snippets)
@@ -505,6 +629,7 @@ def fetch_web_search(query: str) -> str:
       f"'{clean_query}'. Tell the user no verified locations or stock data were found "
       "and do NOT invent addresses or bracketed placeholders."
   )
+
 
 last_transmit_scenario = ""
 last_fallback_fragment = ""
@@ -525,15 +650,23 @@ def generate_hybrid_transmission() -> str:
     last_fallback_fragment = picked
     return picked
 
-  if game_paused or vram["percent"] >= RELAXED_VRAM_PERCENT:
-    return _pick_unique_fallback()
-
   scenarios = (
       [s for s in TRANSMIT_SCENARIOS if s != last_transmit_scenario]
       or TRANSMIT_SCENARIOS
   )
   scenario = random.choice(scenarios)
   last_transmit_scenario = scenario
+
+  if game_paused or vram["percent"] >= RELAXED_VRAM_PERCENT:
+    cloud_fragment = ask_gemini_fallback(
+        messages_override=[
+            {"role": "system", "content": TRANSMIT_GENERATOR_PROMPT},
+            {"role": "user", "content": scenario},
+        ],
+        max_tokens=900,
+        temperature=0.88,
+    )
+    return cloud_fragment if cloud_fragment else _pick_unique_fallback()
 
   for attempt in range(2):
     try:
@@ -551,18 +684,11 @@ def generate_hybrid_transmission() -> str:
     except Exception as e:
       if attempt == 0:
         print(f"[TRANSMIT RECOVERY] Waking LM Studio server ({e})...")
-        subprocess.run(
-            ["lms", "server", "start", "--port", LM_STUDIO_PORT],
-            creationflags=NO_WINDOW_FLAG,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        _run_lms_guarded(["lms", "server", "start", "--port", LM_STUDIO_PORT])
         time.sleep(3)
       else:
         print(f"[TRANSMIT FALLBACK] {e}")
         return _pick_unique_fallback()
-
-
 
 
 async def play_easter_egg_audio(message, filename: str, label: str) -> None:
@@ -572,34 +698,84 @@ async def play_easter_egg_audio(message, filename: str, label: str) -> None:
   if not message.author.voice or not message.author.voice.channel:
     fragment = await asyncio.to_thread(generate_hybrid_transmission)
     await message.channel.send(
-        f"📡 **Audio Relay Offline:** Join a voice channel first to hear **{label}**, {USER_TITLE}.\n\n{fragment}"
+        f"📡 **Audio Relay Offline:** Join a voice channel first to hear"
+        f" **{label}**, {USER_TITLE}.\n\n{fragment}"
     )
     return
 
   if not os.path.exists(filepath):
     await message.channel.send(
-        f"⚠️ **Archive Missing:** Could not locate `{filepath}` in my local memory banks, {USER_TITLE}."
+        f"⚠️ **Archive Missing:** Could not locate `{filepath}` in my local"
+        f" memory banks, {USER_TITLE}."
     )
     return
 
   voice_channel = message.author.voice.channel
   vc = await voice_channel.connect()
   try:
-    await message.channel.send(f"🎵 *Broadcasting hidden frequency: **{label}**...*")
+    await message.channel.send(
+        f"🎵 *Broadcasting hidden frequency: **{label}**...*"
+    )
     vc.play(discord.FFmpegPCMAudio(filepath))
     while vc.is_playing():
       await asyncio.sleep(1)
   finally:
     await vc.disconnect()
 
-def ask_static(user_text):
+
+async def enrich_user_prompt(raw_text: str) -> tuple[str, str | None]:
+  """
+  Attaches live weather or DuckDuckGo search context to a user prompt when triggered.
+  Returns (enriched_text, error_message_if_invalid).
+  """
+  text = raw_text.strip()
+  lowered = text.lower()
+
+  # 1. Manual override: !search <query> forces a live DDGS lookup immediately
+  if lowered.startswith("!search"):
+    forced_query = text[7:].strip()
+    if not forced_query:
+      return (
+          "",
+          f"⚠️ Include a search topic after `!search`, {USER_TITLE} (e.g.,"
+          " `!search RTX 5060 Ti specs`).",
+      )
+    print(f"[DEBUG] Manual !search triggered -> querying DDGS: '{forced_query}'")
+    search_info = await asyncio.to_thread(fetch_web_search, forced_query)
+    print(f"[DEBUG] Search snippet received: {search_info[:120]}...")
+    return f"{forced_query}\n[Live web search results:\n{search_info}]", None
+
+  # 2. Automatic weather lookup
+  if any(w in lowered for w in WEATHER_KEYWORDS):
+    print("[DEBUG] Weather keyword matched -> fetching exact weather...")
+    weather_info = await asyncio.to_thread(fetch_exact_weather)
+    return (
+        f"{text}\n[Live weather context for {DEFAULT_LOCATION}: {weather_info}]",
+        None,
+    )
+
+  # 3. Automatic web search lookup (keywords or 5-digit ZIP codes)
+  if any(w in lowered for w in SEARCH_KEYWORDS) or re.search(
+      r"\b\d{5}\b", lowered
+  ):
+    print("[DEBUG] Search trigger matched -> querying DDGS...")
+    search_info = await asyncio.to_thread(fetch_web_search, text)
+    print(f"[DEBUG] Search snippet received: {search_info[:120]}...")
+    return f"{text}\n[Live web search results:\n{search_info}]", None
+
+  return text, None
+
+
+def ask_static(user_text, history_snapshot: list[dict] | None = None):
   """Sends prompt to LM Studio with dynamic VRAM context-trimming protection."""
   global relaxed_mode
   vram = get_gpu_vram_stats()
   temp_c = vram.get("temp_c")
 
   # Classify live hardware condition so reactive presets (like Vesper) can shift tone
-  if vram["percent"] >= RELAXED_VRAM_PERCENT or (temp_c is not None and temp_c >= 72):
+  if vram["percent"] >= RELAXED_VRAM_PERCENT or (
+      temp_c is not None and temp_c >= 72
+  ):
     hw_state = "STRAINED"
   elif vram["percent"] >= 65.0 or (temp_c is not None and temp_c >= 62):
     hw_state = "WARM"
@@ -608,9 +784,18 @@ def ask_static(user_text):
 
   temp_str = f" | GPU Temp: {temp_c}°C" if temp_c is not None else ""
   now_str = datetime.now().strftime("%A, %I:%M %p")
-  telemetry_tag = f"[Current Time: {now_str} | VRAM: {vram['percent']}%{temp_str} | State: {hw_state}]"
-  chat_history.append({"role": "user", "content": f"{telemetry_tag} {user_text}"})
+  telemetry_tag = (
+      f"[Current Time: {now_str} | VRAM: {vram['percent']}%{temp_str} |"
+      f" State: {hw_state}]"
+  )
+  tagged_user_msg = {"role": "user", "content": f"{telemetry_tag} {user_text}"}
 
+  base_messages = (
+      list(history_snapshot)
+      if history_snapshot is not None
+      else list(chat_history)
+  )
+  working_messages = base_messages + [tagged_user_msg]
 
   # Dynamic Relaxed Mode: shrink history window when VRAM hits >= 80%
   if vram["percent"] >= RELAXED_VRAM_PERCENT:
@@ -621,8 +806,8 @@ def ask_static(user_text):
       )
     relaxed_mode = True
     # Keep index 0 (system prompt) + last 4 messages (2 user/assistant turns)
-    if len(chat_history) > 5:
-      chat_history[:] = [chat_history[0]] + chat_history[-4:]
+    if len(working_messages) > 5:
+      working_messages = [working_messages[0]] + working_messages[-4:]
   else:
     if relaxed_mode:
       print(
@@ -631,35 +816,98 @@ def ask_static(user_text):
       )
     relaxed_mode = False
     # Standard 20-message rolling memory window
-    if len(chat_history) > 21:
-      del chat_history[1:3]
+    while len(working_messages) > 21:
+      del working_messages[1:3]
 
   # Attempt to query LM Studio; if the local server stopped itself, restart it automatically
   try:
     res = llm.chat.completions.create(
-        model = LLM_MODEL, messages=chat_history, temperature=0.7
+        model=LLM_MODEL, messages=working_messages, temperature=0.7
     )
   except Exception as api_err:
-    print(f"[LM STUDIO RECOVERY] Server unreachable ({api_err}) — restarting port {LM_STUDIO_PORT}...")
-    subprocess.run(
-        ["lms", "server", "start", "--port", LM_STUDIO_PORT],
-        creationflags=NO_WINDOW_FLAG,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    print(
+        f"[LM STUDIO RECOVERY] Server unreachable ({api_err}) — restarting port"
+        f" {LM_STUDIO_PORT}..."
     )
+    _run_lms_guarded(["lms", "server", "start", "--port", LM_STUDIO_PORT])
     time.sleep(3)
     res = llm.chat.completions.create(
-        model = LLM_MODEL, messages=chat_history, temperature=0.7
+        model=LLM_MODEL, messages=working_messages, temperature=0.7
     )
 
   reply = (res.choices[0].message.content or "").strip()
   if not reply:
     reply = (
-        f"Signal received, {USER_TITLE}—though my broadcast buffer came back empty."
-        " Could you repeat that transmission?"
+        f"Signal received, {USER_TITLE}—though my broadcast buffer came back"
+        " empty. Could you repeat that transmission?"
     )
-  chat_history.append({"role": "assistant", "content": reply})
   return reply
+
+
+def ask_gemini_fallback(
+    user_text: str | None = None,
+    messages_override: list[dict] | None = None,
+    max_tokens: int = 700,
+    temperature: float = 0.7,
+) -> str | None:
+  """
+  Queries the Gemini OpenAI-compatible endpoint when local VRAM is offloaded.
+  Returns None if unconfigured, rate-limited, or errored so callers can fall back.
+  """
+  if not gemini_llm or not GEMINI_API_KEY:
+    return None
+
+  if user_text:
+    vram = get_gpu_vram_stats()
+    temp_c = vram.get("temp_c")
+    temp_str = f" | GPU Temp: {temp_c}°C" if temp_c is not None else ""
+    now_str = datetime.now().strftime("%A, %I:%M %p")
+    user_text = (
+        f"[Current Time: {now_str} | VRAM: {vram['percent']}%{temp_str} | "
+        f"State: CLOUD_OFFLOAD] {user_text}"
+    )
+
+  if messages_override is not None:
+    payload_messages = messages_override
+  else:
+    recent_turns = chat_history[-10:] if len(chat_history) > 1 else []
+    payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + [
+        m for m in recent_turns if m.get("role") != "system"
+    ]
+    if user_text:
+      last_msg = payload_messages[-1] if payload_messages else {}
+      if not (
+          last_msg.get("role") == "user" and last_msg.get("content") == user_text
+      ):
+        payload_messages.append({"role": "user", "content": user_text})
+
+  request_kwargs = {
+      "model": GEMINI_FALLBACK_MODEL,
+      "messages": payload_messages,
+      "temperature": temperature,
+      "max_tokens": max_tokens,
+  }
+  if GEMINI_REASONING_EFFORT:
+    request_kwargs["reasoning_effort"] = GEMINI_REASONING_EFFORT
+
+  try:
+    res = gemini_llm.chat.completions.create(**request_kwargs)
+    return (res.choices[0].message.content or "").strip() or None
+  except TypeError:
+    # Hotfix guard: retry once without reasoning_effort if endpoint/SDK rejects it
+    request_kwargs.pop("reasoning_effort", None)
+    try:
+      res = gemini_llm.chat.completions.create(**request_kwargs)
+      return (res.choices[0].message.content or "").strip() or None
+    except Exception as retry_err:
+      print(f"[GEMINI FALLBACK WARN] Retry failed: {retry_err}")
+      return None
+  except Exception as e:
+    print(
+        f"[GEMINI FALLBACK WARN] Cloud request failed ({e}) — using local"
+        " fallback."
+    )
+    return None
 
 
 # ==============================================================================
@@ -681,21 +929,38 @@ async def system_monitor():
 
   relaxed_mode = RELAXED_VRAM_PERCENT <= vram_pct < PAUSE_VRAM_PERCENT
 
+  offloaded_now = bool(offload_notice)
   # Hysteresis pause check: pause when offloader is active or VRAM >= 90%, resume below 70%
   should_pause = (
-      bool(offload_notice)
-      or (vram_pct >= PAUSE_VRAM_PERCENT and not game_paused)
-      or (vram_pct > RESUME_VRAM_PERCENT and game_paused)
+      offloaded_now
+      or (vram_pct >= PAUSE_VRAM_PERCENT)
+      or (
+          game_paused
+          and vram_pct > RESUME_VRAM_PERCENT
+          and not (not offloaded_now and vram_pct < PAUSE_VRAM_PERCENT)
+      )
   )
 
   if should_pause and not game_paused:
     game_paused = True
+    offloader_live = await asyncio.to_thread(is_offloader_live)
     reason = "Offloader Active" if offload_notice else f"{vram_pct}% GPU VRAM"
-    print(
-        f"High GPU demand detected ({reason}) — unloading VRAM and pausing"
-        " AI Bot."
-    )
-    await asyncio.to_thread(unload_vram)
+    if offloader_live:
+      print(
+          f"High GPU demand detected ({reason}) — deferring VRAM unload to"
+          " offloader.py; pausing AI Bot."
+      )
+    elif vram_pct >= PAUSE_VRAM_PERCENT:
+      print(
+          f"High GPU demand detected ({reason}, offloader offline) — fallback"
+          " VRAM unload and pausing AI Bot."
+      )
+      await asyncio.to_thread(unload_vram)
+    else:
+      print(
+          f"High GPU demand detected ({reason}, offloader offline) — pausing"
+          " AI Bot."
+      )
 
   elif not should_pause and game_paused:
     game_paused = False
@@ -703,9 +968,12 @@ async def system_monitor():
     if pending_cycle_end and channel:
       pending_cycle_end = False
       async with llm_lock:
+        snapshot = list(chat_history)
         reply = await asyncio.to_thread(
             ask_static,
-            "[SYSTEM: Cycle End triggered after game session. Deliver your nighttime broadcast.]",
+            "[SYSTEM: Cycle End triggered after game session. Deliver your"
+            " nighttime broadcast.]",
+            snapshot,
         )
       await channel.send(reply[:1950])
 
@@ -719,16 +987,18 @@ async def system_monitor():
       pending_cycle_end = True
     elif channel:
       async with llm_lock:
+        snapshot = list(chat_history)
         reply = await asyncio.to_thread(
             ask_static,
             "[SYSTEM: Cycle End triggered. Deliver your nighttime broadcast.]",
+            snapshot,
         )
       await channel.send(reply[:1950])
 
 
 @client.event
 async def on_ready():
-  global startup_sent
+  global startup_sent, game_paused
   print(f"AI Bot connected to Discord as {client.user}")
   if not system_monitor.is_running():
     system_monitor.start()
@@ -737,9 +1007,13 @@ async def on_ready():
     startup_sent = True
     await asyncio.sleep(3)
     channel = client.get_channel(CHANNEL_ID)
+    offload_notice = get_gaming_offload_notice()
+    vram = await asyncio.to_thread(get_gpu_vram_stats)
+    if offload_notice or vram["percent"] >= PAUSE_VRAM_PERCENT:
+      game_paused = True
 
-    # Skip LLM greeting if the offloader already claimed the GPU
-    if channel and not get_gaming_offload_notice():
+    # Skip LLM greeting if offloaded or high VRAM is already active
+    if channel and not game_paused:
       weather_info = await asyncio.to_thread(fetch_exact_weather)
       current_time_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
       prompt = (
@@ -747,24 +1021,29 @@ async def on_ready():
           " wind-down advice or trivia). "
           f"Current local time: {current_time_str}. Live weather data for"
           f" {DEFAULT_LOCATION}: {weather_info}\n"
-          "Greet me warmly for this exact time of day (morning/afternoon/evening)"
-          " and state the current temperature and weather conditions.]"
+          "Greet me warmly for this exact time of day"
+          " (morning/afternoon/evening) and state the current temperature and"
+          " weather conditions.]"
       )
       try:
         # Attempt full AI-generated greeting via LM Studio
         async with llm_lock:
-          reply = await asyncio.to_thread(ask_static, prompt)
+          snapshot = list(chat_history)
+          reply = await asyncio.to_thread(ask_static, prompt, snapshot)
         await channel.send(reply[:1950])
       except Exception as e:
         # Cold-boot fallback: send direct telemetry + weather if weights are still loading
-        print(f"[COLD-START FALLBACK] LM Studio still warming up ({e}) — sending direct greeting.")
+        print(
+            "[COLD-START FALLBACK] LM Studio still warming up"
+            f" ({e}) — sending direct greeting."
+        )
         fallback_msg = (
-            f"⚡ **Systems Online, {USER_TITLE}.** Neural core is warming up in the background.\n"
+            f"⚡ **Systems Online, {USER_TITLE}.** Neural core is warming up in"
+            " the background.\n"
             f"🕒 **Local Time:** {current_time_str}\n"
             f"🌤️ **Weather ({DEFAULT_LOCATION}):** {weather_info}"
         )
         await channel.send(fallback_msg[:1950])
-
 
 
 @client.event
@@ -789,7 +1068,8 @@ async def on_message(message):
         subprocess.run(["xset", "dpms", "force", "off"], check=True)
       except Exception:
         await message.channel.send(
-            f"⚠️ Display power control is unavailable in this Linux session, {USER_TITLE}."
+            "⚠️ Display power control is unavailable in this Linux session,"
+            f" {USER_TITLE}."
         )
     return
   cmd = message.content.strip().lower()
@@ -803,7 +1083,8 @@ async def on_message(message):
       chat_history[:] = [chat_history[0]]
     print(f"[MEMORY] Chat history cleared by {USER_TITLE}.")
     await message.channel.send(
-        f"🧹 **Memory Buffer Flushed, {USER_TITLE}.** Short-term context has been reset to baseline."
+        f"🧹 **Memory Buffer Flushed, {USER_TITLE}.** Short-term context has"
+        " been reset to baseline."
     )
     return
 
@@ -819,43 +1100,76 @@ async def on_message(message):
     return
 
   offload_reply = get_gaming_offload_notice()
-  if offload_reply:
-    await message.channel.send(offload_reply)
-    return
+  is_offloaded_or_paused = bool(offload_reply) or game_paused
 
-  if game_paused:
-    await message.channel.send(f"Broadcast paused while high GPU demand is active, {USER_TITLE}—I'll resume once VRAM clears.")
+  if is_offloaded_or_paused and not gemini_llm:
+    await message.channel.send(
+        offload_reply
+        or (
+            "Broadcast paused while high GPU demand is active,"
+            f" {USER_TITLE}—I'll resume once VRAM clears."
+        )
+    )
     return
 
   async with message.channel.typing():
+    raw_text = message.content.strip()
 
-    text = message.content.strip()
-    lowered = text.lower()
+    enriched_text, validation_err = await enrich_user_prompt(raw_text)
+    if validation_err:
+      await message.channel.send(validation_err)
+      return
 
-    # Manual override: !search <query> forces a live DDGS lookup immediately
-    if lowered.startswith("!search"):
-      forced_query = text[7:].strip()
-      if not forced_query:
-        await message.channel.send(
-            f"⚠️ Include a search topic after `!search`, {USER_TITLE} (e.g., `!search RTX 5060 Ti specs`)."
-        )
+    if is_offloaded_or_paused:
+      cloud_reply = await asyncio.to_thread(ask_gemini_fallback, enriched_text)
+      if cloud_reply:
+        async with llm_lock:
+          chat_history.append({"role": "user", "content": raw_text})
+          chat_history.append({"role": "assistant", "content": cloud_reply})
+          if len(chat_history) > 21:
+            del chat_history[1:3]
+        await message.channel.send(cloud_reply[:1950])
         return
-      print(f"[DEBUG] Manual !search triggered -> querying DDGS: '{forced_query}'")
-      search_info = await asyncio.to_thread(fetch_web_search, forced_query)
-      print(f"[DEBUG] Search snippet received: {search_info[:120]}...")
-      text = f"{forced_query}\n[Live web search results:\n{search_info}]"
-    elif any(w in lowered for w in WEATHER_KEYWORDS):
-      print("[DEBUG] Weather keyword matched -> fetching exact weather...")
-      weather_info = await asyncio.to_thread(fetch_exact_weather)
-      text = f"{text}\n[Live weather context for {DEFAULT_LOCATION}: {weather_info}]"
-    elif any(w in lowered for w in SEARCH_KEYWORDS) or re.search(r"\b\d{5}\b", lowered):
-      print(f"[DEBUG] Search trigger matched -> querying DDGS...")
-      search_info = await asyncio.to_thread(fetch_web_search, text)
-      print(f"[DEBUG] Search snippet received: {search_info[:120]}...")
-      text = f"{text}\n[Live web search results:\n{search_info}]"
+
+      await message.channel.send(
+          offload_reply
+          or (
+              "Broadcast paused while high GPU demand is active,"
+              f" {USER_TITLE}—I'll resume once VRAM clears."
+          )
+      )
+      return
 
     async with llm_lock:
-      reply = await asyncio.to_thread(ask_static, text)
+      now_str = datetime.now().strftime("%A, %I:%M %p")
+      vram_snap = await asyncio.to_thread(get_gpu_vram_stats)
+      temp_snap = vram_snap.get("temp_c")
+      if vram_snap["percent"] >= RELAXED_VRAM_PERCENT or (
+          temp_snap is not None and temp_snap >= 72
+      ):
+        hw_state = "STRAINED"
+      elif vram_snap["percent"] >= 65.0 or (
+          temp_snap is not None and temp_snap >= 62
+      ):
+        hw_state = "WARM"
+      else:
+        hw_state = "NOMINAL"
+      temp_str = f" | GPU Temp: {temp_snap}°C" if temp_snap is not None else ""
+      telemetry_tag = (
+          f"[Current Time: {now_str} | VRAM: {vram_snap['percent']}%{temp_str} |"
+          f" State: {hw_state}]"
+      )
+      user_entry = {"role": "user", "content": f"{telemetry_tag} {enriched_text}"}
+      snapshot = list(chat_history)
+      reply = await asyncio.to_thread(ask_static, enriched_text, snapshot)
+      chat_history.append(user_entry)
+      chat_history.append({"role": "assistant", "content": reply})
+      if vram_snap["percent"] >= RELAXED_VRAM_PERCENT:
+        if len(chat_history) > 5:
+          chat_history[:] = [chat_history[0]] + chat_history[-4:]
+      else:
+        while len(chat_history) > 21:
+          del chat_history[1:3]
     await message.channel.send(reply[:1950])
 
 
