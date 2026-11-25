@@ -27,5 +27,17 @@
   "heavy_standalone_exes": [
     "javaw.exe",
     "java"
+  ],
+  "watched_process_names": [
+    "beservice.exe",
+    "beservice_x64.exe",
+    "easyanticheat.exe",
+    "easyanticheat_eos.exe",
+    "start_protected_game.exe",
+    "eaanticheat.gameservicelauncher.exe",
+    "eaanticheat.gameservice.exe",
+    "gamemon.des",
+    "gamemon64.des",
+    "bootstrapper.exe"
   ]
 }

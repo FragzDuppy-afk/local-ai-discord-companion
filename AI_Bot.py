@@ -825,6 +825,8 @@ def ask_static(user_text, history_snapshot: list[dict] | None = None):
         model=LLM_MODEL, messages=working_messages, temperature=0.7
     )
   except Exception as api_err:
+    if get_gaming_offload_notice():
+      raise RuntimeError("VRAM offloaded mid-request") from api_err
     print(
         f"[LM STUDIO RECOVERY] Server unreachable ({api_err}) — restarting port"
         f" {LM_STUDIO_PORT}..."
@@ -1161,7 +1163,20 @@ async def on_message(message):
       )
       user_entry = {"role": "user", "content": f"{telemetry_tag} {enriched_text}"}
       snapshot = list(chat_history)
-      reply = await asyncio.to_thread(ask_static, enriched_text, snapshot)
+      try:
+        reply = await asyncio.to_thread(ask_static, enriched_text, snapshot)
+      except RuntimeError:
+        # Catch mid-request VRAM offload so we fall back cleanly instead of throwing an unhandled error
+        notice = get_gaming_offload_notice()
+        if notice:
+          cloud_reply = (
+              await asyncio.to_thread(ask_gemini_fallback, enriched_text)
+              if gemini_llm
+              else None
+          )
+          await message.channel.send((cloud_reply or notice)[:1950])
+          return
+        raise
       chat_history.append(user_entry)
       chat_history.append({"role": "assistant", "content": reply})
       if vram_snap["percent"] >= RELAXED_VRAM_PERCENT:

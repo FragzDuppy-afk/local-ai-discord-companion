@@ -13,6 +13,14 @@ try:
 except ImportError:
   NVML_AVAILABLE = False
 
+# Optional Windows WMI hook for instant process-creation detection (pip install wmi pywin32)
+try:
+  import wmi
+
+  WMI_AVAILABLE = os.name == "nt"
+except ImportError:
+  WMI_AVAILABLE = False
+
 
 load_dotenv()
 
@@ -86,7 +94,8 @@ AUTO_RELOAD_ENABLED = (
 UNLOAD_CMD = ["lms", "unload", "--all"]
 RELOAD_CMD = ["lms", "load", LLM_MODEL, "--gpu", "max"]
 
-POLL_INTERVAL_SEC = float(os.getenv("OFFLOADER_POLL_INTERVAL", "1.0"))
+# 0.25s fallback poll keeps reaction fast even without WMI
+POLL_INTERVAL_SEC = float(os.getenv("OFFLOADER_POLL_INTERVAL", "0.25"))
 RELOAD_COOLDOWN_SEC = float(os.getenv("OFFLOADER_RELOAD_COOLDOWN", "20.0"))
 VRAM_SETTLE_MAX_WAIT_SEC = float(os.getenv("OFFLOADER_VRAM_SETTLE_SEC", "8.0"))
 VRAM_SETTLE_TARGET_PCT = float(os.getenv("OFFLOADER_VRAM_TARGET_PCT", "40.0"))
@@ -138,19 +147,22 @@ def normalize_path(path_str: str) -> str:
   return os.path.normpath(os.path.expanduser(path_str)).lower()
 
 
+# Pre-compute watched directory paths once at startup instead of on every loop tick
+NORM_WATCHED_ROOTS = [normalize_path(p) for p in WATCHED_GAME_DIRS]
+
+
 def is_heavy_game_running() -> tuple[bool, str]:
   """
   Scans active processes to detect non-whitelisted games.
   Returns (True, trigger_label) if an offload is needed, else (False, "").
   """
-  norm_roots = [normalize_path(p) for p in WATCHED_GAME_DIRS]
-
   for proc in psutil.process_iter(["name", "exe"]):
     try:
       proc_name = (proc.info["name"] or "").lower()
       if not proc_name or proc_name in WHITELISTED_EXES:
         continue
 
+      # Fast-path match on process name alone (immune to anti-cheat exe path AccessDenied)
       if proc_name in HEAVY_STANDALONE_EXES or proc_name in WATCHED_PROCESS_NAMES:
         return True, proc_name
 
@@ -158,7 +170,7 @@ def is_heavy_game_running() -> tuple[bool, str]:
       if not proc_exe:
         continue
 
-      for root in norm_roots:
+      for root in NORM_WATCHED_ROOTS:
         if proc_exe.startswith(root + os.sep):
           relative_path = os.path.relpath(proc_exe, root)
           game_folder = relative_path.split(os.sep)[0].lower()
@@ -293,8 +305,51 @@ def get_gpu_temp_c() -> int | None:
 # ==============================================================================
 # 3. MAIN WATCHER LOOP
 # ==============================================================================
+def wait_for_next_tick(watcher, timeout_sec: float = POLL_INTERVAL_SEC) -> None:
+  """
+  Blocks up to timeout_sec, but wakes the millisecond Windows spawns a new process.
+  Falls back cleanly to time.sleep() on Linux or if WMI is unavailable.
+  """
+  if watcher is None:
+    time.sleep(timeout_sec)
+    return
+  try:
+    # Block until a process creation event fires or timeout_ms expires
+    event = watcher(timeout_ms=int(timeout_sec * 1000))
+    # Check .Name first (standard for Win32_Process), falling back to .ProcessName
+    proc_name = (
+        getattr(event, "Name", None) or getattr(event, "ProcessName", "") or ""
+    ).lower()
+    # Wake immediately if it's a known heavy/watched process (or any non-whitelisted process)
+    if proc_name and proc_name not in WHITELISTED_EXES:
+      return
+  except Exception:
+    # WMI timeout (normal when no process spawned) or transient error — proceed to scan
+    pass
+
+
 def main():
-  print("[Offloader] Active — watching configured game libraries (1.0s poll)...")
+  # Initialize WMI process creation watcher on Windows for sub-millisecond launch detection
+  proc_watcher = None
+  if WMI_AVAILABLE:
+    try:
+      c = wmi.WMI()
+      proc_watcher = c.Win32_Process.watch_for("creation")
+      print(
+          f"[Offloader] Active — WMI instant hook + {POLL_INTERVAL_SEC}s"
+          " fallback poll..."
+      )
+    except Exception as e:
+      print(
+          f"[Offloader] WMI hook unavailable ({e}); using"
+          f" {POLL_INTERVAL_SEC}s poll..."
+      )
+  else:
+    print(
+        "[Offloader] Active — watching configured game libraries"
+        f" ({POLL_INTERVAL_SEC}s poll)..."
+    )
+
   vram_offloaded = False
   last_game_seen_time = 0.0
   session_start_time = 0.0
@@ -397,7 +452,8 @@ def main():
         )
         last_state_sync = now
 
-    time.sleep(POLL_INTERVAL_SEC)
+    # Wait for either a WMI process-creation event or the short fallback poll timer
+    wait_for_next_tick(proc_watcher, POLL_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
