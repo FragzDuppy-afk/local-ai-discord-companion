@@ -30,6 +30,9 @@ SOUNDS_FOLDER = os.path.join(BASE_DIR, "Sounds")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 CYCLE_END_HOUR = int(os.getenv("CYCLE_END_HOUR", "22"))
+GOODNIGHT_HOUR = int(os.getenv("GOODNIGHT_HOUR", "3"))
+GOODNIGHT_DELAY_SEC = int(os.getenv("GOODNIGHT_DELAY_SEC", "15"))
+
 
 DEFAULT_LOCATION = os.getenv("DEFAULT_LOCATION", "Chicago, IL")
 TIMEZONE_LABEL = os.getenv("TIMEZONE_LABEL", "local time")
@@ -119,6 +122,7 @@ chat_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 llm_lock = asyncio.Lock()
 
 sent_end_today = False
+sent_goodnight_today = False
 pending_cycle_end = False
 game_paused = False
 relaxed_mode = False
@@ -143,6 +147,7 @@ def get_help_manifest() -> str:
         "!search <query>  : Force a live DuckDuckGo web search on any topic\n"
         "!transmit        : Generate a lore transmission / archive broadcast\n"
         "!screenoff       : Power down local monitor signal\n"
+        "!goodnight       : Unload VRAM & power down PC (guarded if game active)"
         f"PRESET AUDIO     : {audio_list}\n"
         "============================================\n"
         "```"
@@ -451,6 +456,31 @@ async def system_monitor():
                 )
             await channel.send(reply[:1950])
 
+    if now.hour == 0 and now.minute == 0:
+        sent_end_today = False
+        pending_cycle_end = False
+        sent_goodnight_today = False
+
+    if (
+        GOODNIGHT_HOUR >= 0
+        and now.hour == GOODNIGHT_HOUR
+        and now.minute < 5
+        and not sent_goodnight_today
+    ):
+        state = hardware.read_offloader_state(OFFLOADER_STATE_FILE)
+        if state.get("vram_offloaded", False):
+            # Defer scheduled shutdown while a game is actively running
+            return
+        sent_goodnight_today = True
+        await asyncio.to_thread(hardware.unload_vram, LMS_LOCK_FILE, LMS_TIMEOUT_SEC)
+        ok, gn_msg = lifecycle.execute_goodnight_protocol(
+            offloaded=False, delay_sec=GOODNIGHT_DELAY_SEC
+        )
+        if channel:
+            await channel.send(f"🕒 **Scheduled Goodnight Cycle, {USER_TITLE}:**\n{gn_msg}")
+        if ok:
+            await client.close()
+            return
 
 @client.event
 async def on_ready():
@@ -537,6 +567,32 @@ async def on_message(message):
                     f" {USER_TITLE}."
                 )
         return
+
+    if cmd in ("!goodnight", "!goodnight force"):
+        force_shutdown = cmd == "!goodnight force"
+        state = hardware.read_offloader_state(OFFLOADER_STATE_FILE)
+        offloaded = bool(state.get("vram_offloaded", False))
+        if offloaded and not force_shutdown:
+            _, guard_msg = lifecycle.execute_goodnight_protocol(
+                offloaded=True,
+                offload_reason=state.get("reason", ""),
+                delay_sec=GOODNIGHT_DELAY_SEC,
+            )
+            await message.channel.send(guard_msg)
+            return
+
+        await asyncio.to_thread(hardware.unload_vram, LMS_LOCK_FILE, LMS_TIMEOUT_SEC)
+        ok, gn_msg = lifecycle.execute_goodnight_protocol(
+            offloaded=offloaded,
+            offload_reason=state.get("reason", ""),
+            delay_sec=GOODNIGHT_DELAY_SEC,
+            force=force_shutdown,
+        )
+        await message.channel.send(gn_msg)
+        if ok:
+            await client.close()
+        return
+
 
     if cmd == "!help":
         await message.channel.send(get_help_manifest())

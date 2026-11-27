@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import time
+import subprocess
 
 
 # ==============================================================================
@@ -201,3 +202,57 @@ def check_ups_status(
     critical = low_battery or (on_battery and charge <= min_battery_pct)
 
     return status, charge, critical
+
+
+# ==============================================================================
+# 4. GOODNIGHT PROTOCOL (ACTIVE-GAME GUARD + GRACEFUL OS SHUTDOWN)
+# ==============================================================================
+def build_os_shutdown_command(
+    delay_sec: int = 15, platform_name: str | None = None
+) -> list[str]:
+    """Returns the cross-platform OS shutdown command for Windows or Linux."""
+    target_os = platform_name if platform_name is not None else os.name
+    if target_os == "nt":
+        return ["shutdown", "/s", "/t", str(max(1, int(delay_sec)))]
+    # Linux fallback (shutdown -h +1 schedules a 1-minute halt)
+    return ["shutdown", "-h", "+1"]
+
+
+def execute_goodnight_protocol(
+    offloaded: bool,
+    offload_reason: str = "",
+    delay_sec: int = 15,
+    force: bool = False,
+    dry_run: bool = False,
+) -> tuple[bool, str]:
+    """
+    Validates that no game is active before initiating a system shutdown.
+    Returns (shutdown_initiated, status_message).
+    """
+    if offloaded and not force:
+        detail = offload_reason or "an active game/workload is running"
+        return (
+            False,
+            f"🛡️ **Goodnight Protocol Deferred:** Active session detected ({detail}). "
+            "Close your game first or use `!goodnight force` to override.",
+        )
+
+    cmd = build_os_shutdown_command(delay_sec=delay_sec)
+    if dry_run:
+        return True, f"[DRY RUN] Would execute: {' '.join(cmd)}"
+
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return (
+            True,
+            f"🌙 **Goodnight Protocol Initiated:** GPU VRAM unloaded. System power-down "
+            f"scheduled in **{delay_sec}s** (`shutdown /a` to abort).",
+        )
+    except Exception as e:
+        return False, f"⚠️ **Goodnight Shutdown Failed:** Could not invoke OS shutdown ({e})."

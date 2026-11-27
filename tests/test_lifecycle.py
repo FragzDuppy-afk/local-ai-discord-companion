@@ -123,7 +123,6 @@ def test_ups_mock_mode_detects_healthy_and_critical_battery(tmp_path):
     assert charge == 20
     assert critical is True
 
-
 def test_ups_nut_mode_parses_tcp_server(monkeypatch):
     # Test NUT parsing cleanly without needing a real upsd daemon running
     def fake_nut_query(host, port, ups_name, var_name, timeout=2.0):
@@ -140,3 +139,39 @@ def test_ups_nut_mode_parses_tcp_server(monkeypatch):
     assert status == "OB LB"
     assert charge == 14
     assert critical is True
+
+def test_goodnight_protocol_blocks_when_game_active():
+    ok, msg = lifecycle.execute_goodnight_protocol(
+        offloaded=True,
+        offload_reason="Unloaded for War Thunder",
+        dry_run=True,
+    )
+    assert ok is False
+    assert "Goodnight Protocol Deferred" in msg
+    assert "War Thunder" in msg
+
+
+def test_goodnight_protocol_allows_force_override():
+    ok, msg = lifecycle.execute_goodnight_protocol(
+        offloaded=True,
+        offload_reason="Unloaded for War Thunder",
+        delay_sec=15,
+        force=True,
+        dry_run=True,
+    )
+    assert ok is True
+    assert "[DRY RUN]" in msg
+
+
+def test_build_os_shutdown_command_cross_platform():
+    assert lifecycle.build_os_shutdown_command(delay_sec=15, platform_name="nt") == [
+        "shutdown",
+        "/s",
+        "/t",
+        "15",
+    ]
+    assert lifecycle.build_os_shutdown_command(delay_sec=15, platform_name="posix") == [
+        "shutdown",
+        "-h",
+        "+1",
+    ]
