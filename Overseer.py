@@ -4,11 +4,14 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from dotenv import load_dotenv
 import psutil
+from subsystems import hardware
+from subsystems import lifecycle
 import telemetry_db
 
 load_dotenv()
@@ -28,7 +31,7 @@ DISCORD_WEBHOOK_URL = os.getenv("OVERSEER_WEBHOOK_URL", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OFFLOADER_STATE_FILE = os.path.join(BASE_DIR, "offloader_state.json")
 LMS_LOCK_FILE = os.path.join(BASE_DIR, "lms_cli.lock")
-LMS_TIMEOUT_SEC = float(os.getenv("OVERSEER_LMS_TIMEOUT_SEC", "20.0"))
+LOCKOUT_FILE = os.path.join(BASE_DIR, "lockout.flag")
 
 VRAM_THRESHOLD_PERCENT = float(os.getenv("OVERSEER_VRAM_THRESHOLD", "85.0"))
 RAM_THRESHOLD_PERCENT = float(os.getenv("OVERSEER_RAM_THRESHOLD", "85.0"))
@@ -165,7 +168,7 @@ def check_and_relieve_memory(
       )
 
     try:
-      with _lms_cli_lock():
+      with hardware.lms_cli_lock(LMS_LOCK_FILE):
         subprocess.run(
             ["lms", "unload", "--all"],
             check=True,
@@ -459,47 +462,60 @@ def send_startup_ping(gpu_handle) -> None:
 # 5. MAIN TELEMETRY LOOP
 # ==============================================================================
 def main():
-  telemetry_db.init_db()
-  print(f"[Overseer] SQLite telemetry initialized -> {telemetry_db.DB_PATH}")
-
-  if not DISCORD_WEBHOOK_URL:
-    print(
-        "[Overseer] Warning: OVERSEER_WEBHOOK_URL not set in .env — alerts"
-        " will print to console only."
-    )
-
-  gpu_handle = None
-  if NVML_AVAILABLE:
-    try:
-      pynvml.nvmlInit()
-      gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-      print("[Overseer] NVML initialized — monitoring GPU VRAM & System RAM...")
-    except pynvml.NVMLError as e:
-      print(f"[Overseer] NVML warning: {e}")
-  else:
-    print(
-        "[Overseer] Warning: 'nvidia-ml-py' not installed. Monitoring System"
-        " RAM only."
-    )
-
-  send_startup_ping(gpu_handle)
-
-  ram_spike_start = 0.0
-  vram_spike_start = 0.0
-  last_ram_alert = 0.0
-  last_vram_alert = 0.0
-  last_sample_log = 0.0
-  last_prune_time = time.time()
-  ram_alert_active = False
-  vram_alert_active = False
-  ram_drift_start = 0.0
-  vram_drift_start = 0.0
-  last_ram_drift_alert = 0.0
-  last_vram_drift_alert = 0.0
+  guard = lifecycle.SingleInstanceGuard(
+      mutex_name="LocalOverseerSingleInstanceMutex",
+      linux_port=49153,
+  )
+  if not guard.acquire():
+    print("[Overseer] Already running in the background. Exiting duplicate.")
+    sys.exit(0)
 
   try:
+    telemetry_db.init_db()
+    print(f"[Overseer] SQLite telemetry initialized -> {telemetry_db.DB_PATH}")
+
+    if not DISCORD_WEBHOOK_URL:
+      print(
+          "[Overseer] Warning: OVERSEER_WEBHOOK_URL not set in .env — alerts"
+          " will print to console only."
+      )
+
+    gpu_handle = None
+    if NVML_AVAILABLE:
+      try:
+        pynvml.nvmlInit()
+        gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        print("[Overseer] NVML initialized — monitoring GPU VRAM & System RAM...")
+      except pynvml.NVMLError as e:
+        print(f"[Overseer] NVML warning: {e}")
+    else:
+      print(
+          "[Overseer] Warning: 'nvidia-ml-py' not installed. Monitoring System"
+          " RAM only."
+      )
+
+    send_startup_ping(gpu_handle)
+
+    ram_spike_start = 0.0
+    vram_spike_start = 0.0
+    last_ram_alert = 0.0
+    last_vram_alert = 0.0
+    last_sample_log = 0.0
+    last_prune_time = time.time()
+    ram_alert_active = False
+    vram_alert_active = False
+    ram_drift_start = 0.0
+    vram_drift_start = 0.0
+    last_ram_drift_alert = 0.0
+    last_vram_drift_alert = 0.0
+
     while True:
       now = time.time()
+
+      locked, lock_reason = lifecycle.is_lockout_active(LOCKOUT_FILE)
+      if locked:
+        print(f"[Overseer] LOTO Lockout active ({lock_reason}) — halting daemon.")
+        break
       ram_percent = psutil.virtual_memory().percent
       used_vram, total_vram, vram_percent = get_gpu_vram_stats(gpu_handle)
       offloader_state = get_offloader_state()
@@ -749,6 +765,7 @@ def main():
         pynvml.nvmlShutdown()
       except pynvml.NVMLError:
         pass
+    guard.release()
 
 
 if __name__ == "__main__":

@@ -2,9 +2,12 @@ import contextlib
 import json
 import os
 import subprocess
+import sys
 import time
 from dotenv import load_dotenv
 import psutil
+from subsystems import hardware
+from subsystems import lifecycle
 
 try:
   import pynvml
@@ -30,7 +33,7 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "offloader_state.json")
 LMS_LOCK_FILE = os.path.join(BASE_DIR, "lms_cli.lock")
-LMS_TIMEOUT_SEC = float(os.getenv("OFFLOADER_LMS_TIMEOUT_SEC", "20.0"))
+LOCKOUT_FILE = os.path.join(BASE_DIR, "lockout.flag")
 
 GAMES_CONFIG_PATH = os.path.join(BASE_DIR, "games_config.json")
 GAMES_EXAMPLE_PATH = os.path.join(BASE_DIR, "games_config.example.json")
@@ -184,41 +187,10 @@ def is_heavy_game_running() -> tuple[bool, str]:
   return False, ""
 
 
-@contextlib.contextmanager
-def _lms_cli_lock(wait_sec: float = 5.0):
-  """Best-effort cross-process lock around `lms` CLI calls without ever deadlocking."""
-  deadline = time.time() + wait_sec
-  acquired = False
-  while time.time() < deadline:
-    try:
-      fd = os.open(LMS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-      os.close(fd)
-      acquired = True
-      break
-    except FileExistsError:
-      try:
-        if time.time() - os.path.getmtime(LMS_LOCK_FILE) > 60.0:
-          os.remove(LMS_LOCK_FILE)
-          continue
-      except OSError:
-        pass
-      time.sleep(0.1)
-    except OSError:
-      break
-  try:
-    yield
-  finally:
-    if acquired:
-      try:
-        os.remove(LMS_LOCK_FILE)
-      except OSError:
-        pass
-
-
 def run_lms_command(cmd: list[str], action_label: str) -> bool:
   """Runs an LM Studio CLI command with a timeout and lock; returns True if successful."""
   try:
-    with _lms_cli_lock():
+    with hardware.lms_cli_lock(LMS_LOCK_FILE):
       print(f"[Offloader] Executing {action_label}: {' '.join(cmd)}")
       subprocess.run(
           cmd,
@@ -329,37 +301,52 @@ def wait_for_next_tick(watcher, timeout_sec: float = POLL_INTERVAL_SEC) -> None:
 
 
 def main():
-  # Initialize WMI process creation watcher on Windows for sub-millisecond launch detection
-  proc_watcher = None
-  if WMI_AVAILABLE:
-    try:
-      c = wmi.WMI()
-      proc_watcher = c.Win32_Process.watch_for("creation")
-      print(
-          f"[Offloader] Active — WMI instant hook + {POLL_INTERVAL_SEC}s"
-          " fallback poll..."
-      )
-    except Exception as e:
-      print(
-          f"[Offloader] WMI hook unavailable ({e}); using"
-          f" {POLL_INTERVAL_SEC}s poll..."
-      )
-  else:
-    print(
-        "[Offloader] Active — watching configured game libraries"
-        f" ({POLL_INTERVAL_SEC}s poll)..."
-    )
+  guard = lifecycle.SingleInstanceGuard(
+      mutex_name="LocalOffloaderSingleInstanceMutex",
+      linux_port=49154,
+  )
+  if not guard.acquire():
+    print("[Offloader] Already running in the background. Exiting duplicate.")
+    sys.exit(0)
 
-  vram_offloaded = False
-  last_game_seen_time = 0.0
-  session_start_time = 0.0
-  current_milestone = ""
-  last_state_sync = 0.0
-  set_offload_state(False, "Offloader initialized")
+  try:
+    # Initialize WMI process creation watcher on Windows for sub-millisecond launch detection
+    proc_watcher = None
+    if WMI_AVAILABLE:
+      try:
+        c = wmi.WMI()
+        proc_watcher = c.Win32_Process.watch_for("creation")
+        print(
+            f"[Offloader] Active — WMI instant hook + {POLL_INTERVAL_SEC}s"
+            " fallback poll..."
+        )
+      except Exception as e:
+        print(
+            f"[Offloader] WMI hook unavailable ({e}); using"
+            f" {POLL_INTERVAL_SEC}s poll..."
+        )
+    else:
+      print(
+          "[Offloader] Active — watching configured game libraries"
+          f" ({POLL_INTERVAL_SEC}s poll)..."
+      )
 
-  while True:
-    now = time.time()
-    heavy_active, trigger_source = is_heavy_game_running()
+    vram_offloaded = False
+    last_game_seen_time = 0.0
+    session_start_time = 0.0
+    current_milestone = ""
+    last_state_sync = 0.0
+    set_offload_state(False, "Offloader initialized")
+
+    while True:
+      now = time.time()
+
+      locked, lock_reason = lifecycle.is_lockout_active(LOCKOUT_FILE)
+      if locked:
+        print(f"[Offloader] LOTO Lockout active ({lock_reason}) — halting daemon.")
+        break
+
+      heavy_active, trigger_source = is_heavy_game_running()
 
     if heavy_active:
       last_game_seen_time = now
@@ -439,12 +426,20 @@ def main():
           set_offload_state(False, "Game exited; VRAM/RAM clear", 0, "")
           last_state_sync = now
       elif now - last_state_sync >= 10.0:
-        # Refresh heartbeat periodically while idle or cooling down
+        # Refresh heartbeat periodically while idle, waiting on cooldown, or cooling down
+        if not vram_offloaded:
+          idle_reason = "Game exited; VRAM/RAM clear"
+        elif now - last_game_seen_time < RELOAD_COOLDOWN_SEC:
+          rem = max(1, int(RELOAD_COOLDOWN_SEC - (now - last_game_seen_time)))
+          idle_reason = f"Post-game cooldown ({rem}s remaining)"
+        else:
+          idle_reason = (
+              f"Cooling down ({get_gpu_temp_c()}°C > {RELOAD_MAX_GPU_TEMP_C}°C target)"
+          )
+
         set_offload_state(
             vram_offloaded,
-            "Game exited; VRAM/RAM clear"
-            if not vram_offloaded
-            else f"Cooling down ({get_gpu_temp_c()}°C > {RELOAD_MAX_GPU_TEMP_C}°C target)",
+            idle_reason,
             int((now - session_start_time) // 60)
             if vram_offloaded and session_start_time > 0.0
             else 0,
@@ -452,8 +447,10 @@ def main():
         )
         last_state_sync = now
 
-    # Wait for either a WMI process-creation event or the short fallback poll timer
-    wait_for_next_tick(proc_watcher, POLL_INTERVAL_SEC)
+      # Wait for either a WMI process-creation event or the short fallback poll timer
+      wait_for_next_tick(proc_watcher, POLL_INTERVAL_SEC)
+  finally:
+    guard.release()
 
 
 if __name__ == "__main__":
