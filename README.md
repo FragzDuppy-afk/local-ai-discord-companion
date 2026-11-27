@@ -14,6 +14,7 @@ Built to run unattended on consumer hardware without Out-of-Memory (OOM) crashes
 * **Anti-Flapping & Thermal-Gated Recovery:** Filters out brief hardware spikes using sustained threshold timers (`>= 85%` for `10s+`), hysteresis pause/resume bands (`90%` pause / `70%` resume), post-exit cooldowns, and NVML GPU thermal ceilings (`RELOAD_MAX_GPU_TEMP_C`) so weights never reload onto a heat-soaked GPU.
 * **Event-Driven Process Detection:** Uses a Windows WMI `Win32_Process` creation hook (with a `0.25s` cross-platform `psutil` fallback) and anti-cheat process-name matching to unload local weights via `lms unload --all` and verify VRAM release via `pynvml` before heavy workloads allocate memory.
 * **Store-and-Forward Telemetry & Drift Detection:** Logs 24-hour rolling RAM/VRAM baselines in **SQLite (WAL mode)** (`telemetry.db`), detects idle baseline drift (`+25%` delta), and buffers Discord webhook alerts locally during network outages for automatic replay upon reconnection.
+* **Pre-Flight Health Gate & UPS LOTO Shutdowns:** Validates credentials and local ports before startup (`subsystems/lifecycle.py`), enforces single-instance OS locks, and supports opt-in **Mock / Network UPS Tools (`nut`)** monitoring with atomic Lockout/Tagout (`lockout.flag`) shutdowns before battery depletion.
 
 ---
 
@@ -113,12 +114,19 @@ ai-bot/
 ├── requirements.txt            # Cross-platform Python dependencies
 ├── .env.example                # Environment variable & threshold template
 ├── games_config.example.json   # Cross-platform game library, anti-cheat & whitelist template
+├── subsystems/
+│   ├── hardware.py             # NVML VRAM telemetry, lms CLI lock & !status builder
+│   ├── lifecycle.py            # Pre-flight health gate, LOTO lockout & Mock/NUT UPS monitor
+│   └── submind.py              # DDGS query sanitization, weather & Gemini cloud fallback
 ├── presets/
 │   ├── default.json            # Default "Atlas" character preset
 │   └── vesper.json             # Alternate hardware-reactive dual-voice "Vesper" preset
 ├── Sounds/
 │   └── .gitkeep                # Optional folder for local voice-channel audio clips
 └── tests/
+    ├── test_hardware.py        # Unit tests for NVML classification, heartbeats & milestones
+    ├── test_lifecycle.py       # Unit tests for LOTO flags, pre-flight gates & UPS modes
+    ├── test_submind.py         # Unit tests for DDGS sanitization & anti-hallucination guards
     └── test_telemetry_and_offloader.py  # Unit tests for SQLite WAL & atomic IPC
 ```
 
@@ -183,16 +191,18 @@ pip install -r requirements.txt
 <summary><strong>4. Running & Testing the Suite</strong> (Click to expand)</summary>
 
 * **One-Click Background Toggle:** Run `Toggle_AI_Bot.bat` on Windows (`.venv` aware) or `./toggle_ai_bot.sh` on Linux to start or stop all three daemons together.
-* **Run Automated Unit Tests:** Verify atomic JSON IPC, PDH VRAM parsing, SQLite WAL rolling baselines, and store-and-forward alert queueing using Python's built-in `unittest` runner:
+* **Run Automated Unit Tests:** Verify query sanitization, LOTO/UPS lifecycles, atomic JSON IPC, PDH VRAM parsing, and SQLite WAL baselines via `pytest`:
   ```bash
-  python -m unittest discover -s tests -v
-  ```
-  ```text
-  [Offloader] Loaded game config: games_config.json
-  test_atomic_state_roundtrip (test_telemetry_and_offloader.TestOffloaderRules.test_atomic_state_roundtrip) ... ok
-  test_pdh_vram_fallback_parses_and_sums_processes (test_telemetry_and_offloader.TestOverseerTelemetry.test_pdh_vram_fallback_parses_and_sums_processes) ... ok
-  test_rolling_baseline_ignores_offloaded_samples (test_telemetry_and_offloader.TestTelemetryDB.test_rolling_baseline_ignores_offloaded_samples) ... ok
-  test_store_and_forward_alert_queue (test_telemetry_and_offloader.TestTelemetryDB.test_store_and_forward_alert_queue) ... ok
+  $ python -m pytest -v
+  ======================== test session starts ========================
+  collected 23 items
+
+  tests/test_hardware.py ....                                    [ 17%]
+  tests/test_lifecycle.py ........                               [ 52%]
+  tests/test_submind.py .......                                  [ 82%]
+  tests/test_telemetry_and_offloader.py ....                     [100%]
+
+  ======================== 23 passed in 2.21s =========================
 
   ----------------------------------------------------------------------
   Ran 4 tests in 0.048s

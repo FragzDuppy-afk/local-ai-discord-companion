@@ -7,17 +7,17 @@ presets/static.json
 
 # Runtime State & Logs
 offloader_state.json
+lms_cli.lock
+lockout.flag
+mock_ups.json
 *.log
 *.db
 *.db-wal
 *.db-shm
 
-# Local Audio Easter Eggs
-Sounds/*.mp3
-Sounds/*.wav
-
-# Python & Virtual Environments
+# Python, Testing & Virtual Environments
 __pycache__/
+.pytest_cache/
 *.py[cod]
 venv/
 .venv/

@@ -19,7 +19,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependencies
-        run: pip install python-dotenv psutil
+        run: pip install pytest python-dotenv psutil ddgs openai
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+        run: python -m pytest -v
