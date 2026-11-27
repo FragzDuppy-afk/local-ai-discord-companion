@@ -4,7 +4,6 @@ import json
 import os
 import subprocess
 import time
-import discord
 import psutil
 import telemetry_db
 
@@ -15,6 +14,15 @@ try:
     NVML_AVAILABLE = True
 except ImportError:
     NVML_AVAILABLE = False
+
+try:
+    import discord
+
+    DISCORD_AVAILABLE = True
+except ImportError:
+    discord = None
+    DISCORD_AVAILABLE = False
+
 
 # Hides console popups on Windows; evaluates to 0 on Linux
 NO_WINDOW_FLAG = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
