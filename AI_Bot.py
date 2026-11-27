@@ -135,23 +135,51 @@ last_fallback_fragment = ""
 # ==============================================================================
 # 3. GENERATION, TRANSMIT & AUDIO HELPERS
 # ==============================================================================
-def get_help_manifest() -> str:
-    """Builds a dynamic command reference including preset-specific audio commands."""
-    audio_list = ", ".join(AUDIO_COMMANDS.keys()) if AUDIO_COMMANDS else "None loaded"
-    return (
-        "```\n"
-        f"=== {BOT_NAME.upper()} COMMAND & RELAY DIRECTORY ===\n"
-        "!help            : Display this command manifest\n"
-        "!status          : Show live CPU, RAM, GPU VRAM, and 24h baseline\n"
-        "!clear           : Wipe short-term conversation memory (fresh context)\n"
-        "!search <query>  : Force a live DuckDuckGo web search on any topic\n"
-        "!transmit        : Generate a lore transmission / archive broadcast\n"
-        "!screenoff       : Power down local monitor signal\n"
-        "!goodnight       : Unload VRAM & power down PC (guarded if game active)"
-        f"PRESET AUDIO     : {audio_list}\n"
-        "============================================\n"
-        "```"
+# Replace get_help_manifest() in Section 3:
+def get_help_manifest() -> discord.Embed:
+    """Builds a styled Discord Embed for the command & relay directory."""
+    audio_list = (
+        ", ".join(f"`{cmd}`" for cmd in AUDIO_COMMANDS.keys())
+        if AUDIO_COMMANDS
+        else "*None loaded*"
     )
+
+    embed = discord.Embed(
+        title=f"📡 {BOT_NAME.upper()} COMMAND & RELAY DIRECTORY",
+        description="Active telemetry, memory, and hardware relay controls.",
+        color=discord.Color.teal(),
+        timestamp=datetime.now(),
+    )
+
+    embed.add_field(
+        name="🖥️ System & Hardware",
+        value=(
+            "`!status` — Live CPU, RAM, GPU VRAM, and 24h baseline\n"
+            "`!screenoff` — Power down local monitor signal\n"
+            "`!goodnight` — Unload VRAM & power down PC *(guarded)*\n"
+            "`!goodnight force` — Override game guard and shut down"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🧠 Neural & Archive",
+        value=(
+            "`!clear` — Wipe short-term conversation memory\n"
+            "`!search <query>` — Force a live DuckDuckGo web search\n"
+            "`!transmit` — Generate a lore transmission / broadcast"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🎵 Preset Audio Relays",
+        value=audio_list,
+        inline=False,
+    )
+
+    embed.set_footer(text=f"Preset: {CHARACTER_PRESET} • Model: {LLM_MODEL}")
+    return embed
 
 
 def build_telemetry_tag(vram: dict) -> str:
@@ -166,12 +194,15 @@ def build_telemetry_tag(vram: dict) -> str:
     )
 
 
-def generate_hybrid_transmission() -> str:
-    """Generates a fresh AI transmission when VRAM < 80%, or uses cloud/archive fallback."""
+def generate_hybrid_transmission() -> tuple[str, str]:
+    """
+    Generates a fresh AI transmission when VRAM < 80%, or uses cloud/archive fallback.
+    Returns (transmission_text, source_badge).
+    """
     global last_transmit_scenario, last_fallback_fragment
     vram = hardware.get_gpu_vram_stats()
 
-    def _pick_unique_fallback() -> str:
+    def _pick_unique_fallback() -> tuple[str, str]:
         global last_fallback_fragment
         choices = (
             [f for f in FALLBACK_FRAGMENTS if f != last_fallback_fragment]
@@ -179,7 +210,7 @@ def generate_hybrid_transmission() -> str:
         )
         picked = random.choice(choices)
         last_fallback_fragment = picked
-        return picked
+        return picked, "ARCHIVE_FALLBACK"
 
     scenarios = (
         [s for s in TRANSMIT_SCENARIOS if s != last_transmit_scenario]
@@ -191,7 +222,7 @@ def generate_hybrid_transmission() -> str:
     if game_paused or vram["percent"] >= RELAXED_VRAM_PERCENT:
         cloud_fragment = cloud_fallback.query(
             system_prompt=SYSTEM_PROMPT,
-            chat_history=chat_history,
+            chat_history=list(chat_history),
             vram_stats=vram,
             messages_override=[
                 {"role": "system", "content": TRANSMIT_GENERATOR_PROMPT},
@@ -200,7 +231,9 @@ def generate_hybrid_transmission() -> str:
             max_tokens=900,
             temperature=0.88,
         )
-        return cloud_fragment if cloud_fragment else _pick_unique_fallback()
+        if cloud_fragment:
+            return cloud_fragment, "CLOUD_RELAY"
+        return _pick_unique_fallback()
 
     for attempt in range(2):
         try:
@@ -214,7 +247,9 @@ def generate_hybrid_transmission() -> str:
                 max_tokens=900,
             )
             fragment = (res.choices[0].message.content or "").strip()
-            return fragment if fragment else _pick_unique_fallback()
+            if fragment:
+                return fragment, "LOCAL_CORE"
+            return _pick_unique_fallback()
         except Exception as e:
             if attempt == 0:
                 print(f"[TRANSMIT RECOVERY] Waking LM Studio server ({e})...")
@@ -229,15 +264,41 @@ def generate_hybrid_transmission() -> str:
                 return _pick_unique_fallback()
 
 
+def build_transmit_embed(fragment: str, source: str) -> discord.Embed:
+    """Wraps a lore transmission or archive broadcast in a styled Discord Embed."""
+    source_styles = {
+        "LOCAL_CORE": (discord.Color.blue(), f"Local Neural Core ({LLM_MODEL})"),
+        "CLOUD_RELAY": (discord.Color.purple(), "Cloud Fallback Relay"),
+        "ARCHIVE_FALLBACK": (discord.Color.dark_grey(), "Static Archive Fragment"),
+    }
+    color, source_label = source_styles.get(
+        source, (discord.Color.blue(), "Relay Broadcast")
+    )
+
+    # Discord embed descriptions support up to 4096 characters (double standard messages!)
+    embed = discord.Embed(
+        title=f"📡 {BOT_NAME.upper()} // INTERCEPTED TRANSMISSION",
+        description=fragment[:4000],
+        color=color,
+        timestamp=datetime.now(),
+    )
+    embed.set_footer(text=f"Source: {source_label} • Preset: {CHARACTER_PRESET}")
+    return embed
+
+
 async def play_easter_egg_audio(message, filename: str, label: str) -> None:
     """Joins user's voice channel to play local MP3, or falls back to hybrid transmission."""
     filepath = os.path.join(SOUNDS_FOLDER, filename)
 
     if not message.author.voice or not message.author.voice.channel:
-        fragment = await asyncio.to_thread(generate_hybrid_transmission)
+        fragment, source = await asyncio.to_thread(generate_hybrid_transmission)
+        embed = build_transmit_embed(fragment, source)
         await message.channel.send(
-            f"📡 **Audio Relay Offline:** Join a voice channel first to hear"
-            f" **{label}**, {USER_TITLE}.\n\n{fragment}"
+            content=(
+                f"📡 **Audio Relay Offline:** Join a voice channel first to hear"
+                f" **{label}**, {USER_TITLE}."
+            ),
+            embed=embed,
         )
         return
 
@@ -250,13 +311,20 @@ async def play_easter_egg_audio(message, filename: str, label: str) -> None:
 
     voice_channel = message.author.voice.channel
     vc = await voice_channel.connect()
+    done = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _after_play(err):
+        if err:
+            print(f"[AUDIO ERROR] {err}")
+        loop.call_soon_threadsafe(done.set)
+
     try:
         await message.channel.send(
             f"🎵 *Broadcasting hidden frequency: **{label}**...*"
         )
-        vc.play(discord.FFmpegPCMAudio(filepath))
-        while vc.is_playing():
-            await asyncio.sleep(1)
+        vc.play(discord.FFmpegPCMAudio(filepath), after=_after_play)
+        await done.wait()
     finally:
         await vc.disconnect()
 
@@ -438,10 +506,6 @@ async def system_monitor():
                 )
             await channel.send(reply[:1950])
 
-    if now.hour == 0 and now.minute == 0:
-        sent_end_today = False
-        pending_cycle_end = False
-
     if now.hour == CYCLE_END_HOUR and now.minute < 5 and not sent_end_today:
         sent_end_today = True
         if game_paused:
@@ -538,8 +602,8 @@ async def on_message(message):
     cmd = message.content.strip().lower()
 
     if cmd == "!status":
-        status_report = await asyncio.to_thread(
-            hardware.build_system_status,
+        status_embed = await asyncio.to_thread(
+            hardware.build_system_status_embed,
             BOT_NAME,
             LLM_MODEL,
             LM_STUDIO_PORT,
@@ -550,7 +614,7 @@ async def on_message(message):
             PAUSE_VRAM_PERCENT,
             OFFLOADER_STALE_SEC,
         )
-        await message.channel.send(status_report)
+        await message.channel.send(embed=status_embed)
         return
 
     if cmd == "!screenoff":
@@ -595,7 +659,7 @@ async def on_message(message):
 
 
     if cmd == "!help":
-        await message.channel.send(get_help_manifest())
+        await message.channel.send(embed=get_help_manifest())
         return
 
     if cmd == "!clear":
@@ -610,8 +674,10 @@ async def on_message(message):
 
     if cmd == "!transmit":
         async with message.channel.typing():
-            fragment = await asyncio.to_thread(generate_hybrid_transmission)
-            await message.channel.send(fragment[:1950])
+            async with llm_lock:
+                fragment, source = await asyncio.to_thread(generate_hybrid_transmission)
+            embed = build_transmit_embed(fragment, source)
+            await message.channel.send(embed=embed)
         return
 
     if cmd in AUDIO_COMMANDS:

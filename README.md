@@ -115,7 +115,7 @@ ai-bot/
 ├── .env.example                # Environment variable & threshold template
 ├── games_config.example.json   # Cross-platform game library, anti-cheat & whitelist template
 ├── subsystems/
-│   ├── hardware.py             # NVML VRAM telemetry, lms CLI lock & !status builder
+│   ├── hardware.py             # NVML VRAM telemetry, lms CLI lock & !status embed builder
 │   ├── lifecycle.py            # Pre-flight health gate, LOTO lockout & Mock/NUT UPS monitor
 │   └── submind.py              # DDGS query sanitization, weather & Gemini cloud fallback
 ├── presets/
@@ -124,7 +124,8 @@ ai-bot/
 ├── Sounds/
 │   └── .gitkeep                # Optional folder for local voice-channel audio clips
 └── tests/
-    ├── test_hardware.py        # Unit tests for NVML classification, heartbeats & milestones
+    ├── test_bot_embeds.py      # Unit tests for !help and !transmit Discord Embed builders
+    ├── test_hardware.py        # Unit tests for NVML classification, status embeds & milestones
     ├── test_lifecycle.py       # Unit tests for LOTO flags, pre-flight gates & UPS modes
     ├── test_submind.py         # Unit tests for DDGS sanitization & anti-hallucination guards
     └── test_telemetry_and_offloader.py  # Unit tests for SQLite WAL & atomic IPC
@@ -195,29 +196,25 @@ pip install -r requirements.txt
   ```bash
   $ python -m pytest -v
   ======================== test session starts ========================
-  collected 23 items
+  collected 30 items
 
-  tests/test_hardware.py ....                                    [ 17%]
-  tests/test_lifecycle.py ........                               [ 52%]
-  tests/test_submind.py .......                                  [ 82%]
+  tests/test_bot_embeds.py ..                                    [  6%]
+  tests/test_hardware.py .....                                   [ 23%]
+  tests/test_lifecycle.py ............                           [ 63%]
+  tests/test_submind.py .......                                  [ 86%]
   tests/test_telemetry_and_offloader.py ....                     [100%]
 
-  ======================== 23 passed in 2.21s =========================
+  ======================== 30 passed in 2.27s =========================
 
-  ----------------------------------------------------------------------
-  Ran 4 tests in 0.048s
-
-  OK
-  ```
 </details>
 
 ---
 
 ## Discord Commands & Custom Personas
-* **`!status`**: Displays live CPU, RAM, GPU VRAM, 24-hour rolling baseline stats, disk headroom, backend state, and `Offloader: LIVE/OFFLINE` status.
+* **`!status`**: Renders a color-coded **Discord Embed** showing live CPU, RAM, GPU VRAM, 24-hour rolling baseline stats, disk headroom, backend state, and `Offloader: LIVE/OFFLINE` status.
 * **`!search <query>` / Natural Search**: Runs sanitized DuckDuckGo lookups with a two-step regional retailer fallback and anti-hallucination guardrails.
-* **`!transmit`**: Generates a 2-paragraph telemetry broadcast (automatically falls back to cloud or cached logs when VRAM is constrained).
-* **`!clear` / `!help` / `!screenoff`**: Resets short-term context, lists active commands, or powers down connected monitors.
+* **`!transmit`**: Generates a 2-paragraph telemetry broadcast inside a source-badged **Discord Embed** (automatically falls back to cloud or cached logs when VRAM is constrained).
+* **`!clear` / `!help` / `!screenoff` / `!goodnight`**: Resets short-term context, displays the categorized command directory embed, powers down connected monitors, or runs a game-guarded system shutdown.
 * **Custom Presets (`presets/`):** Switch between `default` (Atlas) and `vesper` (hardware-reactive dual-voice persona) via `CHARACTER_PRESET` in `.env`, or add your own JSON preset.
 
 ---

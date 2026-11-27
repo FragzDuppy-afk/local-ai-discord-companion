@@ -29,6 +29,9 @@ class SingleInstanceGuard:
             )
             # ERROR_ALREADY_EXISTS == 183
             if ctypes.windll.kernel32.GetLastError() == 183:
+                if self._handle:
+                    ctypes.windll.kernel32.CloseHandle(self._handle)
+                    self._handle = None
                 return False
             return True
 
@@ -249,10 +252,13 @@ def execute_goodnight_protocol(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+  
+        abort_cmd = "shutdown /a" if os.name == "nt" else "shutdown -c"
         return (
             True,
             f"🌙 **Goodnight Protocol Initiated:** GPU VRAM unloaded. System power-down "
-            f"scheduled in **{delay_sec}s** (`shutdown /a` to abort).",
+            f"scheduled in **{delay_sec}s** (`{abort_cmd}` to abort).",
         )
+
     except Exception as e:
         return False, f"⚠️ **Goodnight Shutdown Failed:** Could not invoke OS shutdown ({e})."

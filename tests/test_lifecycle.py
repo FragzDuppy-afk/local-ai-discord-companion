@@ -175,3 +175,16 @@ def test_build_os_shutdown_command_cross_platform():
         "-h",
         "+1",
     ]
+
+def test_goodnight_protocol_shows_os_specific_abort_hint(monkeypatch):
+    monkeypatch.setattr(lifecycle.subprocess, "run", lambda *args, **kwargs: None)
+
+    monkeypatch.setattr(lifecycle.os, "name", "nt")
+    ok_win, msg_win = lifecycle.execute_goodnight_protocol(offloaded=False, delay_sec=15)
+    assert ok_win is True
+    assert "`shutdown /a`" in msg_win
+
+    monkeypatch.setattr(lifecycle.os, "name", "posix")
+    ok_lin, msg_lin = lifecycle.execute_goodnight_protocol(offloaded=False, delay_sec=15)
+    assert ok_lin is True
+    assert "`shutdown -c`" in msg_lin

@@ -1,8 +1,10 @@
 import contextlib
+from datetime import datetime
 import json
 import os
 import subprocess
 import time
+import discord
 import psutil
 import telemetry_db
 
@@ -245,7 +247,7 @@ def evaluate_session_milestone(
 # ==============================================================================
 # 4. SYSTEM MANIFEST BUILDER (!status)
 # ==============================================================================
-def build_system_status(
+def build_system_status_embed(
     bot_name: str,
     llm_model: str,
     lm_studio_port: str,
@@ -255,8 +257,8 @@ def build_system_status(
     relaxed_vram_pct: float = 80.0,
     pause_vram_pct: float = 90.0,
     offloader_stale_sec: float = 15.0,
-) -> str:
-    """Builds the formatted hardware manifest for the !status Discord command."""
+) -> discord.Embed:
+    """Builds a color-coded Discord Embed with live hardware telemetry and 24h baseline."""
     cpu = psutil.cpu_percent(interval=0.5)
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage(os.path.abspath(os.sep))
@@ -270,52 +272,88 @@ def build_system_status(
     disk_free_gb = round(disk.free / (1024**3), 1)
 
     has_baseline = baseline["samples"] > 0
-    ram_avg_str = f" (24h Avg: {baseline['avg_ram']}%)" if has_baseline else ""
-    vram_avg_str = f" (24h Avg: {baseline['avg_vram']}%)" if has_baseline else ""
+    ram_avg_str = f"\n24h Avg: `{baseline['avg_ram']}%`" if has_baseline else ""
+    vram_avg_str = f"\n24h Avg: `{baseline['avg_vram']}%`" if has_baseline else ""
+    temp_str = f" • `{vram['temp_c']}°C`" if vram.get("temp_c") is not None else ""
 
-    cpu_remark = (
-        "NOMINAL" if cpu < 75 else "ELEVATED — Check background processes"
-    )
-    ram_remark = (
-        f"NOMINAL{ram_avg_str}"
-        if ram.percent < 80
-        else f"HIGH LOAD{ram_avg_str} — Close unused apps"
+    # Determine sidebar color & top-level status
+    if game_paused or state.get("vram_offloaded"):
+        color = discord.Color.red()
+        ai_state = "🔴 PAUSED / OFFLOADED"
+    elif relaxed_mode or vram["percent"] >= relaxed_vram_pct:
+        color = discord.Color.gold()
+        ai_state = "🟡 RELAXED (TRIMMED CONTEXT)"
+    else:
+        color = discord.Color.green()
+        ai_state = "🟢 ONLINE (FULL CONTEXT)"
+
+    embed = discord.Embed(
+        title=f"📊 {bot_name.upper()} HARDWARE & EQUIPMENT MANIFEST",
+        description=f"**AI Backend State:** {ai_state}",
+        color=color,
+        timestamp=datetime.now(),
     )
 
+    # Row 1: Compute & Memory (2-column grid)
+    cpu_status = "Nominal" if cpu < 75 else "⚠️ Elevated"
+    embed.add_field(
+        name="⚙️ CPU Load",
+        value=f"`{cpu}%` ({cpu_status})",
+        inline=True,
+    )
+
+    ram_status = "Nominal" if ram.percent < 80 else "⚠️ High Load"
+    embed.add_field(
+        name="🧠 System RAM",
+        value=f"`{ram_used_gb}/{ram_total_gb} GB` (`{ram.percent}%`)\nStatus: {ram_status}{ram_avg_str}",
+        inline=True,
+    )
+
+    # Row 2: GPU VRAM & Storage (2-column grid)
     if vram["percent"] >= pause_vram_pct:
-        vram_remark = f"CRITICAL (>={pause_vram_pct:.0f}%){vram_avg_str} — Model paused/unloaded"
+        vram_status = f"Critical (≥{pause_vram_pct:.0f}%)"
     elif vram["percent"] >= relaxed_vram_pct:
-        vram_remark = f"RELAXED MODE (>={relaxed_vram_pct:.0f}%){vram_avg_str} — Context trimmed"
+        vram_status = f"Relaxed (≥{relaxed_vram_pct:.0f}%)"
     else:
-        vram_remark = f"NOMINAL{vram_avg_str}"
+        vram_status = "Nominal"
 
-    disk_remark = (
-        "NOMINAL" if disk_free_gb > 50 else "LOW SPACE — Archive old logs/builds"
+    embed.add_field(
+        name="🎮 GPU VRAM",
+        value=(
+            f"`{vram['used_gb']}/{vram['total_gb']} GB` (`{vram['percent']}%`){temp_str}\n"
+            f"Status: {vram_status}{vram_avg_str}"
+        ),
+        inline=True,
     )
+
+    disk_status = "Nominal" if disk_free_gb > 50 else "⚠️ Low Space"
+    embed.add_field(
+        name="💾 Primary SSD",
+        value=f"`{disk_free_gb} GB` Free\nStatus: {disk_status}",
+        inline=True,
+    )
+
+    # Row 3: 24h Telemetry & Offloader Daemon
     baseline_line = (
-        f"{baseline['samples']:,} Samples Logged | SQLite WAL Active"
+        f"`{baseline['samples']:,}` Samples Logged • SQLite WAL Active"
         if has_baseline
-        else "Calibrating (Waiting for Overseer samples)"
+        else "Calibrating *(Waiting for Overseer samples)*"
+    )
+    offloader_tag = "🟢 LIVE" if offloader_live else "⚪ OFFLINE"
+    offload_reason = (
+        f"\nActive Guard: *{state['reason']}*"
+        if state.get("vram_offloaded") and state.get("reason")
+        else ""
     )
 
-    if game_paused:
-        ai_state = "PAUSED"
-    elif relaxed_mode:
-        ai_state = "RELAXED"
-    else:
-        ai_state = "ONLINE"
-
-    offloader_tag = "Offloader: LIVE" if offloader_live else "Offloader: OFFLINE"
-
-    return (
-        "```\n"
-        f"=== {bot_name.upper()} HARDWARE & EQUIPMENT MANIFEST ===\n"
-        f"CPU LOAD     : {cpu:>5}%  | {cpu_remark}\n"
-        f"SYSTEM RAM   : {ram_used_gb}/{ram_total_gb} GB ({ram.percent}%) | {ram_remark}\n"
-        f"GPU VRAM     : {vram['used_gb']}/{vram['total_gb']} GB ({vram['percent']}%) | {vram_remark}\n"
-        f"PRIMARY SSD  : {disk_free_gb:>5} GB Free | {disk_remark}\n"
-        f"24H BASELINE : {baseline_line}\n"
-        f"AI BACKEND   : {llm_model} (Port {lm_studio_port}/v1) | {ai_state} | {offloader_tag}\n"
-        "============================================\n"
-        "```"
+    embed.add_field(
+        name="📈 24h Telemetry & Subsystems",
+        value=(
+            f"**Baseline:** {baseline_line}\n"
+            f"**Offloader Daemon:** {offloader_tag}{offload_reason}"
+        ),
+        inline=False,
     )
+
+    embed.set_footer(text=f"Model: {llm_model} • Port: {lm_studio_port}/v1")
+    return embed

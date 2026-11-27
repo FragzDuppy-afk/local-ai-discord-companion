@@ -2,6 +2,7 @@ import json
 import os
 import time
 from subsystems import hardware
+import discord
 
 
 def test_classify_hardware_state_thresholds():
@@ -60,3 +61,63 @@ def test_evaluate_session_milestone_fires_once(tmp_path):
     msg2, last2 = hardware.evaluate_session_milestone(str(state_file), last1, user_title="Operator")
     assert msg2 is None
     assert last2 == "2h"
+
+def test_build_system_status_embed_states(monkeypatch, tmp_path):
+    state_file = tmp_path / "offloader_state.json"
+    state_file.write_text(
+        json.dumps({"vram_offloaded": False, "heartbeat_ts": time.time(), "offloader_pid": os.getpid()}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(hardware.psutil, "cpu_percent", lambda interval=0.5: 22.5)
+    monkeypatch.setattr(
+        hardware,
+        "get_gpu_vram_stats",
+        lambda: {"used_gb": 3.2, "total_gb": 8.0, "percent": 40.0, "temp_c": 54},
+    )
+    monkeypatch.setattr(
+        hardware.telemetry_db,
+        "get_rolling_baseline",
+        lambda hours=24.0: {"samples": 120, "avg_ram": 45.0, "avg_vram": 35.0},
+    )
+
+    # 1. Nominal state -> Green embed with 5 structured fields
+    embed_ok = hardware.build_system_status_embed(
+        bot_name="Atlas",
+        llm_model="google/gemma-4-e2b",
+        lm_studio_port="1234",
+        state_file=str(state_file),
+    )
+    assert isinstance(embed_ok, discord.Embed)
+    assert embed_ok.color == discord.Color.green()
+    assert "ONLINE" in embed_ok.description
+    assert len(embed_ok.fields) == 5
+    assert "40.0%" in embed_ok.fields[2].value
+    assert "54°C" in embed_ok.fields[2].value
+
+    # 2. Relaxed mode -> Gold embed
+    embed_relaxed = hardware.build_system_status_embed(
+        bot_name="Atlas",
+        llm_model="google/gemma-4-e2b",
+        lm_studio_port="1234",
+        state_file=str(state_file),
+        relaxed_mode=True,
+    )
+    assert embed_relaxed.color == discord.Color.gold()
+    assert "RELAXED" in embed_relaxed.description
+
+    # 3. Offloaded / Game paused -> Red embed with active guard reason
+    state_file.write_text(
+        json.dumps({"vram_offloaded": True, "reason": "Unloaded for game.exe"}),
+        encoding="utf-8",
+    )
+    embed_paused = hardware.build_system_status_embed(
+        bot_name="Atlas",
+        llm_model="google/gemma-4-e2b",
+        lm_studio_port="1234",
+        state_file=str(state_file),
+        game_paused=True,
+    )
+    assert embed_paused.color == discord.Color.red()
+    assert "PAUSED / OFFLOADED" in embed_paused.description
+    assert "Unloaded for game.exe" in embed_paused.fields[4].value
